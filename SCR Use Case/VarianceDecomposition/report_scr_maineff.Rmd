@@ -1,0 +1,665 @@
+---
+title: "Use Case \"Insurance SCR\" - Main effects"
+author: "gg"
+date: "`r Sys.Date()`"
+bibliography: ["./literatur/references.bib"]
+link-citations: yes
+output: 
+  bookdown::html_document2:
+    highlight: rstudio 
+    toc: true
+    number_sections: yes
+    toc_depth: 2
+---
+
+\newcommand{\v}[1]{\mathbb{V}{\left[#1\right]}}
+\newcommand{\expect}[1]{\mathbb{E}{\left[#1\right]}}
+\newcommand{\RR}{\mathbb{R}}
+
+\newcommand{\obs}[2]{{#1}^{(#2)}}
+\newcommand{\attr}[3]{{#1}_#3^{(#2)}}
+
+# Introduction
+
+While the use case arises out of a question about life insurance within
+Solvency II no familiarity with either life insurance or Solvency II is
+assumed or required. This report can be read and understood on a stand
+alone basis.
+
+It is the first of a set of five reports on this use case. The five reports are
+* A consecutive set of three reports covering variance decomposition "report_scr_maineff", "report_scr_interaction" and "report_scr_NonParametric". Since they build on each other and the models complexity is gradually increased, it is probably best to read them in this sequence.
+* A report focusing on tails and tail measures "report_scr_Tail"
+* A report performing gradient analysis "report_gradient".
+
+The latter two reports cover independent aspects and do not directly reference each other or the former three reports on variance analysis. The gradient analysis is done using PyTorch's auto-differentiation. Hence, it assumes basic familiarity with using Python runtime environments. But the script contains references to detailed installation instructions.
+
+All other reports are pure R and should run out-of-the-box after installation of the required packages. All packages can be found on CRAN or a mirror. 
+
+
+## Scope and goals of this report
+
+The scope of the report is mainly educational. It does not provide a
+best-practice approach to explainable AI in general or the
+interpretation of this specific use case in particular. Its goals are
+limited to show some of the challenges encountered and some of the
+solutions available. Accordingly, the models discussed are quite basic and the approach to
+model selection, calibration and validation somewhat casual. Hopefully
+the reader is not disappointed by discovering that this first report covers only the most simple main-effects linear model. Even though these models are considered by
+some as "inherently interpretable", they do raise very similar issues to
+those encountered in more complex models. Generalisations to more
+elaborate models are possible since the methods discussed are model
+agnostic. This is evidenced by the later reports covering linear models with interactions and non-parametric models. Furthermore, starting with these models serves as a reminder that
+explainability is neither a new requirement nor a desire restricted to
+machine learning. Finally, it makes sense from an analysis perspective
+to start with the most simple case and take it from there.
+
+In line with those goals the R-programming is basic and avoids
+idiosyncratic constructions of the language. Where reasonable, explicit
+programming is preferred over the use of packages or libraries, even though a best-practice approach would avoid such reinventing the wheel. Nevertheless, in many cases examples using dedicated libraries are provided in addition to the do-it-yourself code examples. 
+
+
+## The methods
+
+Following the taxonomy of [Molnar] the methods discussed here are
+*global* and *model-agnostic*. From a practical perspective this means:
+
+-   Global: Each method produces one single set of statistics for the
+    model and dataset as a whole.
+-   Model agnostic: Those statistics are derived solely by using information obtained by
+    the calibrated model's `predict` method/function.
+
+That said, there are several occasions, where the white-box nature of
+linear models is exploited to gain better insights.
+
+The report focuses on variance as key statistic. The overarching idea
+may be described as feature importance by variance attribution. Variance
+attribution takes the familiar concept of $R^2$ as a share of variance
+explained by a model and pushes this further by attributing this share
+to the input variables. Variance as key statistic makes sense because:
+
+-   It is a familiar concept even vis-a-vis non-technical stakeholders.
+-   It is a natural measure of complexity: A random variable with near
+    zero variance is close to constant. Variance can also be related to
+    L2 norms quantifying the "wiggliness" of functions.
+-   It is closely related to the very convenient square error loss
+    function.
+
+Variance attribution is useful to determine the impact and importance of
+input variables in a quantitative and rigorous fashion. Being able to
+answer the natural question "What are the most important inputs?" is a
+key requirement when explaining a model.
+
+## Use case and data
+
+Since the actuarial ideas behind this use case and reasons for its
+relevance are described in
+[usecase](https://aktuar.de/en/practice-areas/data-science/use-cases/use_case2/Pages/default.aspx),
+it suffices here to give a very condensed description which focuses
+solely on those aspects which are relevant for variance attribution. As stated
+above no familiarity of the actuarial raison d'etre of the use case is
+necessary to follow the report.
+
+The use case boils down to a classical approximation or regression
+problem. The goal is to find an approximation $f$ to an unknown target
+function $\check f=\expect{y \lvert X}$ where the sole information about $\check f$ is a dataset
+$({y}^{(i)},{x}^{(i)})$ with inputs ${x}^{(i)}$ and responses ${y}^{(i)}$.
+The residuals $\epsilon^{(i)} = y^{(i)}-\check{f}(x^{(i)})$ are corrupting noise; it is not possible to
+observe the point evaluations $\check f({x}^{(i)})$ directly.
+
+In addition, due to confidentiality, the actual meaning of the input
+variables is unknown which prevents applying any a-priori knowledge to
+the problem. Furthermore, no information about the distribution of the
+errors is available for this dataset.
+
+The use case itself imposes no natural definition of the norm for
+approximation. But because we try to approximate a conditional expectation, squared error is the natural choice as loss function for calibration of the models' parameters. Accordingly everywhere in this and the subsequent reports squared error is used as loss function. 
+
+There are in total three datasets or "portfolios" available but this
+report only covers the first one.
+
+The following first code block reads in data and the required libraries. 
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo=TRUE, cache = TRUE, cache.comments=FALSE, comment=NA, out.width="90%", attr.source=".numberLines")
+
+suppressPackageStartupMessages(library(knitr))
+suppressPackageStartupMessages(library(kableExtra))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(waterfalls))
+suppressPackageStartupMessages(library(gtools))
+suppressPackageStartupMessages(library(sensitivity))
+
+# seed for reproducibility
+set.seed(4711)
+datadir = "./data/"
+
+# Number of portfolio (change this to 2 or 3 on your own risk)
+ipf = 1
+
+# data (.csv) files
+fnm_xtrain = paste0(datadir,"Portfolio", ipf, "/train_input.csv")
+fnm_ytrain = paste0(datadir,"Portfolio", ipf, "/train_result.csv")
+
+xtrain = as.matrix(read.csv(fnm_xtrain)[,-1])
+
+nxtrain = dim(xtrain)[1]
+nrf = dim(xtrain)[2]
+# names of input variables
+nm_x = paste0("x", seq.int(1,nrf))
+colnames(xtrain) = nm_x
+
+# prepare response aka y
+ytrain = as.matrix(read.csv(fnm_ytrain)[,-1])
+```
+
+The dataset `xtrain` consists of `r nxtrain` observations of `r nrf` attributes
+each. There are no categorical variables hence all inputs are reals.
+
+## Some statistics of the inputs
+
+Unless explicitly mentioned otherwise all probabilities and statistics
+always refer to the empirical measure as defined by the dataset `xtrain`
+or subsets thereof.
+
+### Marginal distribution
+
+All margins of the inputs except the 7th input variable $x_7$ are
+uniform. As examples the exhibit below shows the empirical CDFs of $x_1$
+and $x_7$
+
+```{r}
+allrf = c(1, 7)
+
+for(irf in allrf){
+  plot(ecdf(xtrain[,irf]), main=paste0("Empirical CDF of input variable: ", irf))
+}
+```
+
+### Correlation {#inputcorrelation}
+
+The dependence structure of the inputs is not known, but empirical
+correlations can be readily computed.
+
+```{r}
+cormat = cor(xtrain)
+idxpair = which(lower.tri(matrix(0, nrf, nrf)), arr.ind = TRUE)
+tmp = cbind(round(cormat[idxpair] * 100, 2), idxpair)
+tmp = tmp[order(abs(tmp[,1]), decreasing = TRUE),]
+colnames(tmp) = c("correlation", colnames(idxpair))
+ntmp = 4
+tmp[1:ntmp,]
+```
+
+The table above shows the top `r ntmp` correlations in percent sorted by
+decreasing absolute value. Again variable $x_7$ is special because it is
+the only one with significant correlations (strongly to the 1st and less
+so to the 3rd and 2nd variable) while all other correlations are near
+zero[^1].
+
+[^1]: Note that this joint distribution of the input variables seems to
+    contradict the statements found in the section "Underlying data set"
+    in the use case description.
+
+
+The relationship between $x_1$ and $x_7$ is further evidenced by the following scatter plot.
+
+```{r}
+print(
+  ggplot(data.frame(x1 = xtrain[,1], x7=xtrain[,7]), aes(x=x1, y=x7)) + 
+    geom_point(size=0.1) )
+```
+
+The domain is clearly non-rectangular, which creates the negative correlation. The regular patterns are due to the dataset being generated by a quasi Monte Carlo sequence.   
+
+# Main effects model
+
+## Model definition and fit
+
+A main effects model is a linear model where only the input variables are used
+as features. The linear main effects model is defined as
+$$ f(x) = \beta_0 + \beta_1 x_1 + \cdots + \beta_d x_d.$$ As mentioned
+above $d =$ `r nrf` is the number of attributes or input variables. The fit to determine the model's parameters is done by least squares on a subset chosen iid from the full
+dataset.
+
+## $R^2$ and variance explained
+
+The Mean Squared Error (MSE) of a model $f$ on response data $y$ is defined as $\expect{(y - f)^2}.$ To make this slightly more intuitive and better comparable across different data sets and models this report uses normalised MSE, i.e $R^2$, which is defined as
+$$ R^2 = 1 - \frac{ \expect{(y - f)^2}}{\v{y}}.$$
+
+the symbols $\expect{}$ and $\v{}$ denote expectation and variance with respect to the empirical measure.  For models which include constant functions as features (i.e. with an intercept term) and are fit by least squares the MSE on the training set is equal to the residual variance  $\v{y - f}$, and the variance of $y$ can be split into a sum $\v{y}=\v{f} + \v{y-f}$. This decomposition is the paradigmatic example of a *variance decompostion* or *variance attribution*: The overall variance $\v{y}$ is split into the sum of two terms, where each term itself is the variance of a component related to the model. All attempts at variance decomposition follow this pattern.   
+
+In this case $R^2$ simplifies to $$ R^2 = \frac{\v{f}}{\v{y}}.$$
+This justifies the interpretation of $R^2$ as the *variance explained* by the model $f$. 
+
+```{r, fig.cap="Variance decomposition into percent \"explained\" and \"residual\""}
+# size of subset for the calibration
+dessize = 4000
+# select the points in the design
+idxdes = sample.int(nxtrain, dessize, replace = FALSE)
+x = xtrain[idxdes,]
+y = ytrain[idxdes]
+# fit the model
+dfin = as.data.frame(cbind(y, x))
+md = lm( y ~ ., dfin)  
+
+# we just use the last model retained from above 
+cf = md$coefficients[-1]
+# variance of the response
+var_y = var(y)
+# variance of the fitted model, we do not need the intercept
+var_f = var(x %*% cf)
+relvar_f = var_f / var_y
+relvar_res = 1 - relvar_f
+df = data.frame(values = c(round(relvar_f * 100,1), round(relvar_res * 100,1)), 
+                labels=c("explained (f)", "residual"))
+p = waterfall( df, calc_total = TRUE, total_axis_text = "response (y)")
+print(p)
+```
+
+It is difficult to assess from the residual variance alone whether the
+model is a good or bad fit. This is because the residual variance has
+two very different components: An unavoidable variance which is caused
+by the random noise $\epsilon$ and a deterministic component which is
+due to the lack of fit between $f$ and $\check f$. The unavoidable
+variance contained in the `r paste0(round(relvar_res * 100,1),"%")`
+above will remain even if we could use the true regression function $\check f$ for
+prediction. So, if a large part of the residual variance is already due
+to noise, the model can be considered quite good and there will be
+little room for improvement by a better model. But disentangling these
+two components would require detailed information about size and
+structure of the noise which is not available[^2].
+
+[^2]: Indeed it is well known that these errors are in general
+    heteroskedastic. Furthermore, often certain shortcuts in the
+    generation of the inner scenarios are employed to increase speed. Typical examples are antithetic variables or the shift algorithm for the initial yield curve. 
+    These shortcuts may create complicated dependencies between errors
+    at different outer scenarios. Unfortunately this is not covered in
+    the use case description. While the use case provides additional data on error variance, this is not available for the base scenarios considered here.  
+    
+## In sample vs. out of sample fit
+
+Since calibration of linear models is fast and requires no intervention from the user,
+it is easy to perform a couple of them on different subsets to
+test stability and detect possible overfitting.
+
+```{r}
+# number of iterations
+niter = 10
+rsq = array(Inf, dim=c(niter,3), dimnames = list(NULL, c("out", "in", "delta")) )
+for(iiter in 1:niter){
+  # select the points in the design
+  tmp = sample.int(nxtrain, 2 * dessize, replace = FALSE)
+  idxtmp = tmp[1:dessize]
+  xtmp = xtrain[idxtmp,]
+  ytmp = ytrain[idxtmp]
+  
+  # test data for out-of-sample
+  idxtest = tmp[-(1:dessize)]
+  xtest = xtrain[idxtest,]
+  ytest = ytrain[idxtest]
+  
+  # fit the model
+  mdtmp = lm( ytmp ~ ., as.data.frame(cbind(ytmp, xtmp)))
+  # calculate Rsquareds
+  rsq[iiter,"in"] = 1 - mean((ytmp - mdtmp$fitted.values)^2) / var(ytmp)
+  rsq[iiter, "out"] = 1 - mean((ytest - predict(mdtmp, as.data.frame(xtest)))^2) / var(ytest)
+}
+
+rsq[,"delta"] = rsq[, "out"] - rsq[,"in"]
+rsq = rbind(rsq,colMeans(rsq))
+row.names(rsq) = c(rep("",niter), "mean")
+kable_styling(kable(rsq*100, digits = 1, caption = "In and out of sample $R^2$ for repeated model calibration"
+          ), bootstrap_options = "striped", full_width = F)
+```
+
+In conclusion, no overfitting is apparent. For this reason we do not need to distinguish between in and out of sample statistics for this model. Solely for reasons of simplicity the remainder of this first report will use only in sample statistics.
+
+## Standardised regression coefficients
+
+Linear models are sometimes deemed inherently interpretable because the
+model structure is simple and easily accessible. It is natural to use
+this knowledge to explain the effects of the features on the outcome.
+The main effects model is the sum of $\beta_i x_i$ so a natural
+candidate for the effect size of theses terms is their normalised
+variance, i.e. the [standardised regression
+coefficients](https://en.wikipedia.org/wiki/Standardized_coefficient)
+defined as
+$$ \mathit{src_i}^2 = 
+  \frac{\mathbb{V}{\left[\beta_i x_i\right]}}{\mathbb{V}{\left[y\right]}}.$$
+The following chart shows the decomposition for the `r nrf` variables $X_1,\ldots,X_d$  involved.
+
+```{r , fig.cap="\"Decomposition\" using squared standardised regression coefficients "}
+# empirical variance of the inputs
+var_x = apply(x, 2, var)
+# standard(ised) regression coefficients
+stdregcf = cf^2 * var_x / var_y 
+
+df = data.frame(values = round(c(stdregcf) * 100,1), 
+                labels=c(names(stdregcf)) )
+p = waterfall( df, calc_total = TRUE, total_axis_text = "???")
+print(p)
+```
+
+This "decomposition" has the obvious problem that the terms do not add
+up to 100%. While this could be easily fixed (or fudged?) by simply
+rescaling the sum to 100%, it is important to appreciate the underlying
+reason for the issue. The reason the terms don't sum up to 100% is the
+correlation between the variables: The variance of a sum is equal to the
+sum of variances only if variables are uncorrelated. This is not the
+case here as was shown in Section \@ref(inputcorrelation). In fact
+standardised regression coefficients are pure marginal statistics and
+ignore completely any dependence between the input variables. Given that
+$x_1$ and $x_7$ are strongly negative correlated the stand alone impact
+on variance of either one is highly inflated. This is because any change
+in one variable will be countered by some corresponding change in
+opposite direction of the other variable thus partially cancelling their
+joint impact on the variance. As a consequence this approach seems only
+valid for uncorrelated input variables.
+
+## Permutation feature importance
+
+While standard regression coefficients have been around since the last
+century, permutation feature importance was first published 2001 and is
+a very popular approach in machine learning. See [Section
+8.5.1](https://christophm.github.io/interpretable-ml-book/feature-importance.html)
+of [Molnar] or [Section
+4.2](https://scikit-learn.org/stable/modules/permutation_importance.html)
+of [SciKit-learn].
+
+Although permutation feature importance is readily available in many machine learning packages it is simple enough to be reprogrammed from scratch below. The main idea is to
+measure the average increase in error when the model is evaluated on
+data points where the value of a feature is permuted. Since it is not
+feasible to calculate all permutations the average is approximated by
+Monte-Carlo. A careful analysis of the code below or the description of
+the algorithm reveals that the method is indeed model-agnostic, i.e. it
+just relies on a model's `predict` method. Solely for reasons of speed
+the code below does not use the `predict` method of the respective `md`
+object but does the evaluation explicitly by performing the matrix
+multiplication.
+
+```{r, fig.cap="\"Decomposition\" using permutation feature importance"}
+# unperturbed loss
+pred_orig = md$coefficients[1] + x %*% cf
+loss_orig = sum((y - pred_orig)^2)
+
+# number of MC iterations
+niter = 1000
+# store for cumulated errors
+err = rep(0, nrf)
+# loop over features
+for(ifeat in 1:nrf){
+  # calculate the constant part and don't forget the intercept
+  pred_noni = md$coefficients[1] + x[,-ifeat] %*% cf[-ifeat]
+  # MC loop
+  for(iiter in 1:niter){
+    perm = sample.int(dessize)
+    # include the permuted feature in the model's prediction 
+    pred_neu = pred_noni + cf[ifeat] * x[perm,ifeat]
+    # increase in loss due to permuted features
+    delta_mse = sum((y - pred_neu)^2) - loss_orig
+    err[ifeat] = err[ifeat] + delta_mse
+  }
+}
+
+# normalise err
+err = err / var_y / 2 / (dessize - 1) / niter
+
+df = data.frame(values = round(c(err) * 100,1), 
+                labels=c(nm_x) )
+print(waterfall( df, calc_total = TRUE, total_axis_text = "???") )
+```
+
+Comparison with the prior chart reveals, that, indeed, for the linear
+model permutation feature importance is identical to standardised
+regression coefficients up to a constant factor of two. But this means that the
+same caveats apply to the analysis based on permutation feature
+importance as they apply to standardised regression coefficients.
+Furthermore, the fact that permutation destroys the underlying
+dependence structure of features should not come as a surprise to any
+user and is not limited to the linear model or the squared error
+loss.[^3]
+
+[^3]: These issues often seem to be largely ignored by practitioners.
+    See for example the discussion of variable importance for the
+    disability use case in the original report (@Kopinsky). In the
+    regression context these problems have been known and discussed for
+    decades. The Machine Learning community apparently rediscovered them recently (@Hooker2021).
+
+## New features
+
+### Block allocation
+
+Since most input variables of our use case are uncorrelated and the
+trouble is caused only by some few variables, one way to work around the
+problem may be to treat those troublesome features as a single block.
+This block as a whole then gets variance allocated together with all
+other uncorrelated variables. It was shown in \@ref(inputcorrelation)
+that only the variables $x_i$ with $i\in \{1,2,3,7\}$ are correlated. We
+introduce a new variable
+$$ z = \beta_1 x_1 + \beta_2 x_2 +\beta_3 x_3 +\beta_7 x_7$$ and
+calculate the standardised regression coefficients for the new variable
+$z$ and the rest.
+
+```{r, fig.cap="Attribution of variance on blocks of inputs"}
+# detect variables with non-trivial correlation
+eps = 1/100
+cormat = cor(xtrain)
+idx = lower.tri(cormat)
+# flag those pairs with absolute correlation larger than the eps-threshold
+idx_tmp = which(abs(cormat) > eps, arr.ind = TRUE)
+flg = idx_tmp[,1] < idx_tmp[,2]
+idx_ntcorr = idx_tmp[flg,,drop=FALSE]
+# the correlated variables
+idx_c = unique(c(idx_ntcorr))
+# the complement, i.e. the uncorrelated ones
+idx_nc = seq.int(1,nrf)[-idx_c]
+
+# define new variable from correlated variables
+zblock = x[,idx_c] %*% cf[idx_c]
+src_zblock = var(zblock) / var_y
+src_other = cf[idx_nc]^2 * var_x[idx_nc] / var_y
+leakage = relvar_f - (src_zblock + sum(src_other) )
+
+df = data.frame(values = round(c(src_other, src_zblock, leakage) * 100,1), 
+                labels=c(names(src_other), "z", "leakage"))
+print(waterfall( df, calc_total = TRUE, total_axis_text = "explained"))
+```
+
+The good news is that now the variances almost sum up to the variance of
+$f$ which is `r paste0(round(relvar_f * 100,1), "%")`. The small difference, which is called leakage in the graph, is due to sampling error. When measured with the full dataset containing `r nxtrain` items, the correlations between zblock and the rest are close to zero. This is no longer true when using the smaller size of `r dessize` as was done here. This fact can be easily verified using the full training set, as is done below.
+
+```{r, fig.cap="No leakage on the full dataset"}
+# variance split on the whole dataset
+varall_x = apply(xtrain, 2, var)
+src_zblockall = var(xtrain[,idx_c] %*% cf[idx_c]) / var_y
+src_allother = cf[idx_nc]^2 * varall_x[idx_nc] / var_y
+relvar_fall = var(xtrain %*% cf) / var_y
+leakage = relvar_fall - (src_zblockall + sum(src_allother) )
+df = data.frame(values = round(c(src_allother, src_zblockall, leakage) * 100,1), 
+                labels=c(names(src_other), "z", "leakage"))
+print(waterfall( df, calc_total = TRUE, total_axis_text = "explained"))
+```
+
+Indeed, leakage is (sufficiently close to) zero when using all available data. Note that the variance of $f$ (the right black bar "explained") has changed from `r paste0(round(relvar_f * 100,1), "%")` to `r paste0(round((relvar_fall - 0.0005) * 100,1), "%")` since the dataset has changed.
+
+But no matter which dataset we choose for calibration, the bad news remains. The block defined by $z$ is by far the most important variable. We can peek into the block to see exactly how big the problem is, but still have no way of distributing the contribution from the correlation.
+
+```{r zblock-corr, fig.cap="Incomplete variance attribution for the z-block"}
+# z-block break down
+
+var_xinz = cf[idx_c]^2 * var_x[idx_c]
+src_xinz = var_xinz / var_y
+src_delta = src_zblock - sum(src_xinz)
+df = data.frame(values = round(c(src_xinz, src_delta) * 100,1), 
+                labels=c(names(src_xinz), "correlation") )
+print(waterfall( df, calc_total = TRUE, total_axis_text = "z"))
+```
+
+### Principal components
+
+The idea of introducing new variables can be pushed further by replacing
+the correlated variables $x_1, x_2, x_3, x_7$ by uncorrelated features
+$z_1, z_2, z_3, z_7$. Since correlation is a linear dependence measure
+this amounts to a linear transformation of the features, which leaves
+the structure of the linear model unchanged. Indeed we use as new
+variables the four principal components respectively the eigenvectors of
+the covariance matrix in order of their variance, $z_1$ having largest
+$z_4$ smallest variance.
+
+```{r}
+# extract troublesome covariance submatrix
+smcovmat = cov(x[,idx_c])
+# diagonalise the matrix
+svdob = svd(smcovmat)
+U = svdob$u
+
+# define the new uncorrelated features
+tmp_z = x[,idx_c] %*% U
+
+# sanity check: near zero correlations
+cvtmp = cov(tmp_z)
+if(any( abs(cvtmp[upper.tri(cvtmp)]) > 1e-12 )){
+  stop("New features are not uncorrelated")
+}
+
+# define new feature matrix and coefficients
+z = cbind(x[,idx_nc], tmp_z)
+colnames(z) = c(colnames(x)[idx_nc], paste0("z", seq.int(1,length(idx_c))))
+cfz = c(cf[idx_nc], cf[idx_c] %*% U)
+names(cfz) = colnames(z)
+# sanity check: model predictions remain the same
+pred_x = x %*% cf
+pred_z = z %*% cfz
+if(any( abs(pred_x-pred_z) > 1e-12 )){
+  stop("Predictions are not equal!")
+}
+```
+
+Note the "sanity check" in lines 21-26 at the end of the code block above. It shows that the new features are
+just a transformation of coordinates and do not change the model
+predictions. Now that all features are uncorrelated it is straightforward to allocate
+the variance:
+
+```{r, fig.cap="Attribution with uncorrelated features", out.width="100%"}
+# allocate variance on new features
+src_zfeat = cfz^2 * apply(z,2,var) / var_y
+leakage = relvar_f - sum(src_zfeat)
+
+df = data.frame(values = round(c(src_zfeat, leakage) * 100,1), 
+                labels=c(names(src_zfeat), "leakage") )
+print(waterfall( df, calc_total = TRUE, total_axis_text = "ex-\nplained"))
+```
+
+Quite remarkably literally all variance is allocated to a single
+principal component: $z_4$. This is all the more surprising as $z_4$ is
+the principal component with the smallest variance among the four and
+nicely illustrates the challenge of dimension reduction using principal
+components only.
+
+### Do new features increase interpretability?
+
+Whether the introduction of new features helps in improving
+explainability or whether this is just a confusing excuse for failing to
+do better depends very much on the specific features and the domain of
+their application. Unfortunately, in our Use Case we do not know
+anything about the actual input variables and this question is
+impossible to decide. It can only be illustrated by some complete
+hypotheticals. For example assume the z-block were a group of variables
+which have some underlying connection, such as all being biometric risk
+factors. Then allocation on this block could readily be translated into
+a statement such as "Biometric risk makes up
+`r paste0(round(src_zblock * 100,1), "%")` of the total variance". Most
+likely such a statement would be considered an explanation of what is
+going on. If on the other hand the four variables making up the block
+were, say, lapse rate, EUR/CHF FX rate and two bond indices, allocation
+on this jumble of variables would not be considered an explanation but a
+coincidence. An expressive new feature which has an intrinsic actuarial
+interpretation independent from the sample and the model is arguably the
+best and strongest way to understand the underlying reality and a most
+convincing explanation. On the other hand, no matter what input
+variables you have, you can always transform them into principal
+components. But there will in general be no reason for those components
+to have any meaning beyond being eigenvectors of an empirical covariance
+matrix.
+
+## Variance allocation according to the Shapley algorithm
+
+A well known way to allocate contributions to each member of a set is
+the marginal principle and its generalisation the Shapley algorithm. To apply this principle one needs to specify three items:
+
+  1. The members which shall receive the allocations, 
+  2. An overall amount which is to be allocated to each member
+  3. A value function, which distributes the overall amount to the members. 
+  
+Here, the members are the input variables $X_1,\ldots, X_d$ and the overall amount 
+is the variance $\v{f}$ of the full model. The value function must be
+able to assign some of the total amount, i.e. variance, to every possible subset of members. For the case discussed here the value function is the variance from a linear model which employs the subset $\left\{X_1, \ldots, X_k\right\}$ from all available features.
+This allows to define the increase in value due to inclusion of variable
+$X_{k+1}$ as
+$$ \Delta v(k+1) = \v{\mathcal{M}\left[(X_1,\ldots,X_{k+1})\right]} - \v{\mathcal{M}\left[(X_1,\ldots,X_{k})\right]}$$ 
+where $\mathcal{M}$ denotes the response of the model calibrated using the first $k$ respective $k+1$ inputs.
+An attribution just based on these marginal increases will depend on the
+sequence of variables which does not make sense, since this sequence is
+completely arbitrary. To fix this, the Shapley algorithm simply computes
+increases for all possible permutations and finally averages over them. Observe, that for each permutation the sum of its marginal increases always adds up to the
+variance of the full model. Accordingly the mean does this as well, so
+attribution by the Shapley algorithm is additive. 
+
+As a simple demonstration the allocation for the four variables
+$x_1, x_2, x_3, x_7$ making up the $z$.block from Section \@ref(block-allocation) is programmed below.
+
+```{r lmg-pedestrian}
+# the required permutations
+pm = permutations(length(idx_c), length(idx_c), idx_c)
+nperm = dim(pm)[1]
+nc = dim(pm)[2]
+
+erg_ss = array(0, dim = dim(pm), dimnames = NULL)
+colnames(zblock) = "zblock"
+# fit models sequentially for each permutation
+# step through all permutations
+for(iperm in 1:nperm){
+  idx = pm[iperm,]
+  df = as.data.frame(cbind(zblock,x[,idx]))
+  # sequential model fit, step through all variables in sequence of permutation
+  for(ii in 1:nc){
+    md_tmp = lm( zblock ~ ., df[,c(1,1 + (1:ii))])
+    # remember variance for this group
+    erg_ss[iperm, ii] = var(md_tmp$fitted.values)
+  }
+}
+
+# calculate increase in variance
+# prepend term with no variables, i.e. constant having zero sum of squares
+erg_ss = cbind(rep(0, nperm), erg_ss)
+# difference per row, i.e. increase of sum of squares due to new variable
+inc_ss = t(diff(t(erg_ss)))
+# relate increments to variables and aggregate all pertaining to one variable 
+df_tmp = data.frame(variable=c(pm), inc_ss = c(inc_ss))
+tmp = aggregate(inc_ss ~ variable, df_tmp, sum)
+# normalise
+val_lgm = tmp$inc_ss / nperm / c(var(zblock))
+
+df = data.frame(values = round(c(val_lgm * c(var(zblock)) / var_y) * 100,1), 
+                labels=c(nm_x[idx_c]) )
+print(waterfall( df, calc_total = TRUE, total_axis_text = "z"))
+```
+
+This chart corresponds directly to the chart \@ref(fig:zblock-corr) where correlation was not distributed.
+
+Due to being an average contribution, the amounts attributed by the Shapley algorithm may be somewhat less intuitive than directly attributed amounts. But Shapley values are always non-negative, add up to the whole amount, no matter the dependence and are uniquely defined by a set of axioms. See [Molnar] Section [9.5.3.1](https://christophm.github.io/interpretable-ml-book/shapley.html#the-shapley-value)^[What he describes as "Shapley values" is different from the definition used here. He does not distinguish between the value and the algorithm for allocation and uses a different value but his general statements mostly remain valid and apply to the situation here.] or (@Grömping) for a discussion in the context of variance attribution for linear models. But the Shapley algorithm has also been criticised and may produce counterintuitive results (see (@ShapleyProblems)).
+
+Note also that we had to recalibrate the model for each subset (in line 15 of the prior code block). In that sense the method would not qualify as completely "model-agnostic". In practice this is not a restriction for the linear model as it can be quickly calibrated without manual intervention. 
+
+The pedestrian approach above is woefully inefficient, which is why it was only demonstrated for four of the variables. With more efficient programming, larger numbers of variables can be handled. That said, the algorithm requires a runtime proportional to $2^d$, i.e. exponential time. For the Use Case the number of variables is $d=$ `r nrf` which is small enough to be no problem, as is demonstrated below by a computation for all variables using the package `sensitivity`.
+
+```{r}
+tt = lmg(x, y)
+df = data.frame(values = round(c(tt$lmg) * 100,1), 
+                labels=c(nm_x) )
+print(waterfall( df, calc_total = TRUE, total_axis_text = "explained"))
+```
+
+Notice that the Shapley attribution produces the same numbers as before for the uncorrelated variables as well as for the variables in the $z$-block. The small difference between the explained value in the chart and the correct explained variance from earlier charts is due to rounding. There is no leakage when using the Shapley algorithm.
+
+# References

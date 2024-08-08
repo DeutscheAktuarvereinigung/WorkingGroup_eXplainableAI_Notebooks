@@ -1,0 +1,508 @@
+---
+title: "Use Case 'insurance_scr_data' - Gradient analysis"
+author: "gg"
+date: "`r Sys.Date()`"
+output: 
+  bookdown::html_document2:
+    highlight: rstudio 
+    toc: true
+    number_sections: yes
+    toc_depth: 2
+bibliography: report_gradient.bib
+---
+
+
+\newcommand{\v}[1]{\mathbb{V}{\left[#1\right]}}
+\newcommand{\expect}[1]{\mathbb{E}{\left[#1\right]}}
+\newcommand{\RR}{\mathbb{R}}
+
+# Introduction
+
+This report describes a novel and non-standard approach to the explanation of the use-case insurence-scr. First, a Gaussian Process Regressor, a very flexible non-parametric regression model, is fitted to the data together then its gradient field is calculated. Analysis of the gradient field will not only provide insights into the Gaussian Process model but suggests the definition of a very simple model with predictive quality comparable to the Gaussian Process model.
+
+This simple model is - in comparison to the Gaussian one- extremely easy to interpret. This simplicity makes it straightforward to compare properties of the model with prior knowledge about the data generating process, i.e. properties of the portfolio of insurance policies and their supporting assets.
+
+In addition, and going beyond the specific use-case, a broader audience of users might be interested in the computational techniques employed in the analysis. This script showcases the smooth interplay between R and sophisticated Python programming frameworks as facilitated by the package 'reticulate'. In particular, this application demonstrates the ease of using PyTorch's feature of automatic differentiation.
+
+As stated above the approach is novel and non-standard. This is slightly surprising, since the calculation of gradients with auto-differentiation is fast and simple and the analysis of the gradient field is the natural generalisation of the analysis of regression coefficients in main effects linear models.  
+
+
+# Define libraries
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo=TRUE, cache = TRUE, cache.comments=FALSE, 
+                      comment=NA, out.width="90%", attr.source=".numberLines")
+
+suppressPackageStartupMessages(library(knitr))
+suppressPackageStartupMessages(library(kableExtra))
+suppressPackageStartupMessages(library(ggplot2))
+
+# 3D plot
+suppressPackageStartupMessages(library(rgl))
+options(rgl.useNULL = TRUE)
+options(rgl.printRglwidget = TRUE)
+setupKnitr(autoprint = TRUE)
+
+# SIM model
+suppressPackageStartupMessages(library(splines))
+
+# Python related
+suppressPackageStartupMessages(library(reticulate))
+use_condaenv(condaenv = "gpytorch", conda = "auto")
+```
+
+Note that in addition to the R packages above the execution of this script requires installation of PyTorch and GPyTorch. PyTorch supports CUDA-based GPU acceleration but this is not required for the moderate size of the use case. Installation is straightforward by following the instructions for [Torch installation](https://pytorch.org/get-started/locally/) and [GPyTorch installation](https://gpytorch.ai/).  
+
+# Define Python functions
+
+The following class and function definitions are standard definitions for hyper parameter optimization and prediction using the GPyTorch framework. They are more or less directly taken from the [GPyTorchExample](https://docs.gpytorch.ai/en/latest/examples/01_Exact_GPs/Simple_GP_Regression.html). The relevant paper describing the GPYTorch framework is (@gardner2018gpytorch).
+
+GPyTorch builds on top of [PyTorch](https://pytorch.org/) which provides the automatic differentiation feature. A look at the code shows that differentiation is very accessible, being just a call to the relevant method. In the listing below this can be found in lines 130, 131 consisting of
+
+```{python, eval=F}
+pred_y.backward(torch.ones_like(pred_y))
+test_grad = pred_x.grad.numpy(force=True)
+```
+
+More details on Torch's autograd can be found at [Autograd Tutorial](https://pytorch.org/tutorials/beginner/blitz/autograd_tutorial.html). 
+
+
+```{python, sourcepy}
+# source_python("gp_calpred.py", envir = globalenv(), convert = TRUE)
+import math
+import torch
+import gpytorch
+
+torch.set_default_dtype(torch.float64)
+
+class ExactGPModel(gpytorch.models.ExactGP):
+    """ Definition of a standard GP model
+    
+    For details see documentation at https://gpytorch.ai/
+    """
+    
+    def __init__(self, train_x, train_y, likelihood):
+        super(ExactGPModel, self).__init__(train_x, train_y, likelihood)
+        self.mean_module = gpytorch.means.ConstantMean()
+
+        self.covar_module = gpytorch.kernels.ScaleKernel(
+            gpytorch.kernels.MaternKernel(ard_num_dims=r.nrf, nu=2.5))
+                    
+    def forward(self, x):
+        mean_x = self.mean_module(x)
+        covar_x = self.covar_module(x)
+        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+
+
+# Function train
+def gprtrain(params, tr_x, tr_y):
+    """ Trains the GP model
+    
+    Chooses hyperparameters and predicts on training data.
+    
+    Args:
+        params: dict of two optimiser parameters, learning_rate, train_cycles
+        tr_x: training inputs as n-by-d numpy array 
+        tr_y: training outputs as n-by-1 numpy array 
+    Returns:
+        dict containing 
+        pred_train: predictions on training data
+        nll: development of negative log likelihood during training 
+        mstate: dict containing all info on the model, for details see 
+        https://docs.gpytorch.ai/en/stable/examples/00_Basic_Usage/Saving_and_Loading_Models.html
+    """
+    
+    # reticulate related conversions, you need those, trust me!
+    # arrays are write protected
+    tmp = tr_x.copy()
+    train_x = torch.from_numpy(tmp)
+    tmp = tr_y.copy()
+    # tr_y is a n-by-1 matrix (2 axis), we require 1-axis array
+    train_y = torch.from_numpy(tmp.ravel("A"))
+
+    # initialize likelihood and model
+    likelihood = gpytorch.likelihoods.GaussianLikelihood()
+    model = ExactGPModel(train_x, train_y, likelihood)
+
+    # Model hyperparameters
+    model.train()
+    likelihood.train()
+    # optimize
+    optimizer = torch.optim.Adam(model.parameters(), lr=params["learning_rate"])
+
+    # "Loss" for GPs - the marginal log likelihood
+    mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
+    
+    # Hyperparameter optimisation
+    nll = torch.zeros(params["train_cycles"])
+    for i in range(params["train_cycles"]):
+        # Zero gradients from previous iteration
+        optimizer.zero_grad()
+        # Output from model
+        output = model(train_x)
+        # Calc loss and backprop gradients
+        loss = -mll(output, train_y)
+        loss.backward()
+        optimizer.step()
+        nll[i] = loss.item()
+        
+    # Get into evaluation (predictive posterior) mode
+    model.eval()
+    likelihood.eval()
+    
+    with torch.no_grad(), gpytorch.settings.fast_pred_var():
+        pred_train = likelihood(model(train_x)).mean
+    
+    return dict(pred_train=pred_train.numpy(), nll=nll.numpy(), mstate=model.state_dict())
+
+
+# Function predict
+def gprpred(tr_x, tr_y, mstate, x):
+    """ Uses a trained GP model to predict values and gradient
+    
+    Assumes a prior trained model defined by a state dict
+    
+    Args:
+        tr_x: training inputs as n-by-d numpy array 
+        tr_y: training outputs as n-by-1 numpy array
+        mstate: state dict as created by gprtrain
+        x: input for prediction as n-by-d numpy array 
+    Returns:
+        pred_train: predictions on  tr_x (n-by-1)
+        pred_test: predictions on x (n-by-1)
+        train_grad: Gradients on tr_x (n-by-d)
+        test_grad: Gradients on x (n-by-d)
+    """
+    
+    # reticulate related conversions, you need those, trust me!
+    tmp = tr_x.copy()
+    train_x = torch.from_numpy(tmp)
+    tmp = tr_y.copy()
+    # tr_y is a n-by-1 matrix (2 axis), we require 1-axis array
+    train_y = torch.from_numpy(tmp.ravel("A"))
+    tmp = x.copy()
+    pred_x = torch.from_numpy(tmp)
+    
+    # initialise model
+    likelihood = gpytorch.likelihoods.GaussianLikelihood()
+    model = ExactGPModel(train_x, train_y, likelihood)
+    
+    model.load_state_dict(mstate)
+    
+    # Get into evaluation (predictive posterior) mode
+    model.eval()
+    likelihood.eval()
+    
+    with gpytorch.settings.fast_pred_var():
+        pred_x.requires_grad_()
+        pred_y = likelihood(model(pred_x)).mean
+        pred_y.backward(torch.ones_like(pred_y))
+        test_grad = pred_x.grad.numpy(force=True)
+        
+        # for whatever reasons this does not work correctly with train_x
+        tt = train_x.clone().detach().requires_grad_(True)
+        train_res = likelihood(model(tt)).mean
+        train_res.backward(torch.ones_like(train_res))
+        train_grad = tt.grad.numpy(force=True)
+    
+    return dict(pred_train = train_res.numpy(force=True),
+                pred_test = pred_y.numpy(force=True),
+                train_grad = train_grad,
+                test_grad = test_grad)
+```
+
+
+# Read use-case data
+
+The following block reads in the use-case data.
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+# seed for reproducibility
+set.seed(4711)
+datadir = "../data_orig/"
+
+# Number of portfolio (change this to 2 or 3 on your own risk)
+ipf = 1
+
+# data (.csv) files
+fnm_xall = paste0(datadir,"Portfolio", ipf, "/train_input.csv")
+fnm_yall = paste0(datadir,"Portfolio", ipf, "/train_result.csv")
+
+xall = as.matrix(read.csv(fnm_xall)[,-1])
+
+nxall = dim(xall)[1]
+nrf = dim(xall)[2]
+# names of input variables
+nm_x = paste0("x", seq.int(1,nrf))
+colnames(xall) = nm_x
+
+# prepare response aka y
+yall = read.csv(fnm_yall)[,-1]
+```
+
+
+# Set up design
+
+```{r}
+dessize = 2000
+
+# random design
+flg_indes = logical(nxall)
+flg_indes[sample.int(nxall, dessize, replace = FALSE)] = TRUE
+xtrain = xall[flg_indes,]
+ytrain = as.matrix(yall[flg_indes])
+
+xtest = xall[!flg_indes,]
+ytest = as.matrix(yall[!flg_indes])
+```
+
+For calibration of the Gaussian Process model a random subset of `r dessize` points is selected. Larger numbers do not really improve the fit.
+
+
+# Calibration
+
+The calibration of the Gaussian Process model is completely standard. It consists of determining the length scale and variance of a 5/2 Matern kernel by likelihood maximisation and subsequently determining the coefficients of the basis functions for the training set.
+
+```{r, gprcalibrate}
+# Parameters for calibration 
+ex = list(train_cycles = c(50L),
+    learning_rate = c(0.1)
+)
+
+# fit GPR
+calib = py$gprtrain(ex, xtrain, ytrain)
+# development of negative log likelihood 
+# delete comments if you would like to see the development of the likelihood during optimisation
+# nll = calib$nll
+# ggplot(data.frame(x=1:length(nll), nll=nll), aes(x=x, y=nll)) + geom_line() + theme_bw()
+
+# predict and calculate gradients
+pred = py$gprpred(xtrain, ytrain, calib$mstate, xtest)
+
+# #quick plausi
+# all.equal(calib$pred_train, pred$pred_train)
+```
+
+```{r}
+# in-sample performance
+perf_ins_1 = 1 - mean((as.vector(pred$pred_train) - ytrain)^2) / var(ytrain)
+perf_ins_2 = 1 - mean((as.vector(calib$pred_train) - ytrain)^2) / var(ytrain)
+# oos performance
+perf_oos = 1 - mean((as.vector(pred$pred_test) - ytest)^2) / var(ytest)
+
+df_stat = data.frame(xvalues=c("in sample", "oo sample"), GPR= round(c(perf_ins_1, perf_oos),3)*100)
+kable_styling(kable(df_stat, caption = "R squared values"), 
+              bootstrap_options = "striped", full_width = F)
+```
+
+This example shows the two good reasons for using GP regression: GP regression works out-of-the-box and attains a good fit as seen by the high R-squared. Since we use the default kernel, which is the Matern 5/2, the resulting model is differentiable.
+
+
+# Gradient norm
+
+A basic property of the gradient flow is whether it has critical points or not. This check is performed in the next block. The norm of the gradients at any input point $x$ of the design is calculated and shown in the next exhibit.
+
+```{r, gradnorm, message=FALSE, warning=FALSE}
+
+# Repackaging of function values and the gradients 
+allgrad = rbind(pred$train_grad, pred$test_grad)
+colnames(allgrad) = nm_x
+f = c(pred$pred_train, pred$pred_test)
+
+# calculate length of gradients
+grad_norm = sqrt(rowSums(allgrad^2))
+ggplot(, aes(x=f, y=grad_norm)) + geom_point(shape=42) + geom_smooth(colour="red", se=F) +
+    coord_cartesian(ylim = c(0, 5)) + theme_bw() +
+    ggtitle("|| \u2207f || against f")
+```
+
+To have a simple 2D visualisation, the norm of the gradients $\lVert \nabla f(x) \rVert$ at the points $x$ are scatterd against the respective function values $f(x)$. This is a non-standard graph, so its shape must be interpreted with care, but the important fact that the norm is positive is apparent.
+
+Since the gradient field never vanishes, one can already conclude that the function has no maximum, minimum or critical points in the interior of its domain of definition. Furthermore, the graph of $f$ can be "visualised" locally as consisting of identical $d-1$-dimensional level sets, each indexed by a function value.
+
+
+# 2D Gradient visualisation
+
+The natural next step in analysing the gradient field, is to look at its direction(s). This poses a larger challenge than the norm, since the gradient at a point is not a scalar but a $d$-dimensional vector. As always, there are two ways to visualise this: 2D/3D projection and summary by taking averages. In this and the next section we study orthogonal projections of $\nabla f$ on various planes, spanned by pairs of inputs. Practically, given any two inputs $x_i$ and $x_j$,  this means to study scatter plots of pairs of real numbers 
+$$ \left( \frac{\partial f}{\partial x_i}(x), \frac{\partial f}{\partial x_j}(x)\right)$$
+for each design point $x$. 
+
+The following graphs show these scatter plots for selected pairs. The code contains the (commented out) option to show all possible pairs of inputs respectively all 
+possible planes. In addition to the points themselves, the plots contain three more elements: a unit circle to give a better sense of scale, the average (or the centre of gravity) of the point cloud, depicted by an arrow and a colour scale for the points. 
+
+The colours represent the function values $f(x)$ of the points. Colours run from red for low function values to yellow for large values. But note, that the scale is not parametrised by the function values themselves but by their cumulative probabilities called ```f_qt``` in the script. For example, an orange-ish point, shown in the legend at 0.75, refers to a function value so large that 75% of points are less, a reddish point at 0.25 is so low that only 25% of values are lower and so on. This is just to avoid saturation of the colour scale.
+
+```{r, grad2d}
+# f coordinates as ecdf, low probs mean low function values
+f_qt = rank(f) / (length(f) + 1)
+
+# points for the circle
+tmpangle = seq(0,1, length.out=200) * 2 * pi
+xtmp = cos(tmpangle)
+ytmp = sin(tmpangle)
+dftmp = data.frame(xtmp, ytmp)
+
+plt_fun = function(coordsel){
+    grad_sel = allgrad[, coordsel]
+    df = data.frame(grad_sel, f_qt = f_qt)
+    avggrad = colMeans(grad_sel)
+
+    print(
+        # ggplot(df, aes(x=df[,1], y=df[,2], colour = f_qt)) + geom_point(alpha=0.5, shape=42) +
+        ggplot(df[sample.int(nxall, 4000),], aes(x=.data[[coordsel[1]]], y=.data[[coordsel[2]]], colour = f_qt)) + 
+            geom_point(alpha=1, shape=42) +
+        scale_color_gradient(low = "red", high = "yellow") +
+        geom_point(data = dftmp, aes(x=xtmp, y=ytmp), shape=42, colour="black") +
+        geom_path(data = data.frame(x=c(0,avggrad[1]), y=c(0, avggrad[2])),
+                  aes(x=x,y=y), colour="black", arrow=arrow(ends = "last")) +
+        coord_fixed() +
+        theme_bw()
+    )
+}
+    
+allcoord = list(c("x1", "x5"), c("x1", "x7"), c("x1", "x13"), 
+                c("x5", "x7"), c("x5", "x13"),
+                c("x7", "x13"), c("x7", "x8"), c("x8", "x9"))
+
+# in case anyone wants to see ALL plan
+#idxpair = which(lower.tri(matrix(0, nrf, nrf)), arr.ind = TRUE)
+#allcoord = data.frame(rbind(paste0("x", idxpair[,1]), paste0("x", idxpair[,2])))
+# allcoord = list(c("x1", "x5"))
+
+dummy = lapply(allcoord, plt_fun)
+
+```
+
+The graphs are completely consistent with the understanding of the importance of the inputs, as established in previous reports. Variables such as ```x1```, ```x7``` have large components of gradients, while the components of "unimportant" variables such as ```x8``` or ```x9``` have small gradients. In that respect the plots confirm the understanding but do not provide new information. 
+
+What is new, and quite surprising, is the fact that all (non-trivial) projections of the gradients point in roughly the same direction. The largest spread is seen when ```x13``` is included but even there directions only vary between 20-25 degrees.
+
+Furthermore, the plots show that gradients are larger and more dispersed with lower function values.
+
+
+# 3D Gradient visualisation
+
+The next exhibit contains basically the same kind of plot as the section before. The only exception being that now gradients are projected on a 3 dimensional hyperplane spanned by the inputs "x1", "x7", "x13". To fully appreciate the spatial information provided by the plot the reader should look at the graph in a dynamic document format such as HTML and vary the viewpoint. In addition the information should be reconciled with the 2D-plots from the prior section for the three planes spanned by the three pairs of inputs. 
+
+
+```{r, grad3d}
+
+grad_sel = allgrad[,c("x1", "x7", "x13")]
+grad_mean = colMeans(grad_sel)
+
+lat <- matrix(seq(90, -90, length.out = 50)*pi/180, 50, 50, byrow = TRUE)
+long <- matrix(seq(-180, 180, length.out = 50)*pi/180, 50, 50)
+xx <- cos(lat)*cos(long)
+yy <- cos(lat)*sin(long)
+zz <- sin(lat)
+
+get_colors <- function(values){
+    v <- (values - min(values))/diff(range(values))
+    x <- colorRamp(c("red", "yellow"))(v)
+    rgb(x[,1], x[,2], x[,3], maxColorValue = 255)
+    }
+
+invisible(plot3d(grad_sel, col=get_colors(f_qt), alpha=0.05))
+invisible(arrow3d(p0 = c(0, 0, 0), p1 = grad_mean))
+aspect3d(1,1,1)
+
+rglwidget()
+
+```
+
+The 3D view confirms the impression of the planar plots before. The dispersion in the lower  (red) tail of $f$ values is clearly visible. Visible is also the fact that gradient directions the average and the dispersion cloud are not aligned with any of the sides or axis. In that sense single inputs do not capture well what is going on; all relevant directions always involve combinations of all inputs. But the directions for values not at the lower or upper tail, those coloured orange to red, form a tight tube with elliptical cross section around the axis defined by the arrow of the average gradient.    
+
+# Single Index model
+
+From the analysis in the prior sections it is clear that the gradient field varies in length but shows only limited variability in direction. This observation suggests a change in the modelling approach. Instead of having an extremely flexible model, such as Gaussian Process regression, it may suffice to use a model, which is just flexible enough to represent data with variation in the length of gradients but near constant direction. 
+
+The most simple model, the main effects linear model, is ruled out by this requirement. The gradient of a linear main effects model is constant, in direction and length. This inadequacy may explain the poor performance of this model. The calculation of its $R^2$ can be found in the script "Main effects" and it was only around 86%. Obviously this is much worse than the 94% achieved by the Gaussian Process model.
+
+The next step in increasing flexibility is allowing the length of the gradient to vary, while its direction remains constant. These kind of models are well known. They are called Single Index Models and are defined by
+$$ f_{\text{SIM}}(x) = r(g^T x)$$
+where $r:\RR\rightarrow\RR$ is a scalar function, which is often called the ridge function of the model, and $g\in\RR^d$, the index, a constant vector. To make the model identifiable the additional conditions $\Vert g \lVert=1$ and $r'\geq 0$ are imposed. 
+
+The gradient of $f_{\text{SIM}}$ is
+$$ \nabla f_{\text{SIM}}(x)=r'(g^Tx)g$$ and its length
+$$ \lVert \nabla f_{\text{SIM}}(x)\rVert=\lvert r'(g^Tx)\rvert.$$
+Indeed, this means that the gradient has constant direction but can vary in length.
+
+The specification above is very similar to a GLM but with two important differences. Underlying a GLM is a stochastic assumption, which defines the link function and the likelihood, which is then used to determine the index. In a Single Index model no explicit stochastic assumption is made. Accordingly, the ridge function is not known in advance and the fit is by least squares.
+
+The next code block implements this idea. The index is the average gradient obtained from the Gaussian Process model. The ridge function is a spline fit by least squares.
+
+```{r}
+# average gradient
+# note: use only training values
+grad_avg = colMeans(allgrad)
+grad_avg = grad_avg / sqrt(sum(grad_avg^2))
+# define the index
+xitrain = xtrain %*% grad_avg
+xitest = xtest %*% grad_avg
+xi = rbind(xitrain, xitest)
+
+# fit a univariate spline model
+md_si = lm(y ~ ns(x,df=10), data = list(y=ytrain, x=xitrain) )
+# summary(md_si)
+fsi_train = md_si$fitted.values
+fsi_test = predict(md_si, list(x=xitest))
+fsi = c(fsi_train,fsi_test)
+
+# statistics
+r2_si_in = 1 - mean((ytrain - fsi_train)^2) / var(ytrain)
+r2_si_out = 1 - mean((ytest - fsi_test)^2) / var(ytest)
+
+df_stat$SIM = round(c(r2_si_in, r2_si_out),3)*100
+kable_styling(kable(df_stat, caption = "R squared values"), 
+              bootstrap_options = "striped", full_width = F)
+```
+
+The performance of this simple model is quite surprising. It almost matches the performance of the Gaussian Process model!
+
+
+# Standalone Single Index model
+
+Even though the model above is strikingly simple, one might argue that the determination of the index still requires the Gaussian Process model with gradient calculation. But this is not true. Single Index models are just a special case of a technique dating back to the 70s called [Projection Pursuit Regression](https://en.wikipedia.org/wiki/Projection_pursuit_regression), which is implemented in base(!) R as the function ```ppr```.
+
+The next code block implements a single index model from scratch using this function.
+
+```{r}
+
+# fit SIM using the ppr function
+md_ppr = ppr(xtrain, ytrain, nterms = 1, sm.method = "spline", df = 10)
+ppr_train = md_ppr$fitted.values
+ppr_test = predict(md_ppr, xtest)
+ppr = c(ppr_train,ppr_test)
+
+# statistics
+r2_ppr_in = 1 - mean((ytrain - ppr_train)^2) / var(ytrain)
+r2_ppr_out = 1 - mean((ytest - ppr_test)^2) / var(ytest)
+
+df_stat$PPR = round(c(r2_ppr_in, r2_ppr_out),3)*100
+kable_styling(kable(df_stat, caption = "R squared values"), 
+              bootstrap_options = "striped", full_width = F)
+```
+
+# Interpretation
+
+The simplicity of the model structure makes interpretation very easy. The level surfaces are just the intersection of the hyperplanes $g^T x=\text{const}$ with the domain of definition of the underlying data. The function along the level surfaces is just a function of a single variable. Its graph can be plotted and visually analysed. This is done in the next exhibit.
+
+```{r}
+# plot ridge function 
+lb = min(xitrain)
+ub = max(xitrain)
+xtmp = seq(from=lb, to=ub, length.out=200)
+rsi = predict(md_si, list(x=xtmp))
+ggplot(data.frame(index = xtmp, ridge=rsi), 
+       aes(x=index, y=ridge)) + geom_line(linewidth=1) + 
+    ggtitle("Ridge function of the Single Index model") + theme_bw() 
+
+```
+
+In a way this seems to be already all there is to this model!
+
+But the model invites a level of interpretation which goes deeper than just analysis from a data science perspective. This attempt at interpretation is genuinely actuarial and refers back to the underlying data generating process. Recall that the original data of the use case are approximate values of cash flows from assets and liabilities of underlying insurance contracts. While it is somewhat speculative, it is also tempting to interpret the model in terms of these underlying items. The ridge function could then be interpreted as the value of the pay out of future cash flows under the management rules and the index as its underlying, i.e. the net position of assets and liabilities. Seen in this light the shape of the ridge function is suggestive. At both tails it is linear, reflecting the fact that if a option is deeply out of or in the money, its pay-out is linear. Furthermore the slope on the upper tale is less steep than the slope at the lower tale. This is a well known property of cash flows from life insurance portfolios with profit sharing. In good times profits are shared with policyholders, flattening the increase, while in bad times, embedded guarantees cause the full loss to be borne by shareholders. This fits the 1-1 relation between losses in the underlying assets/liabilities as measured by the index and the value of the ridge function in the lower tail.
+
+To reiterate, this is suggestive but speculative since the use case provides none of the internal data necessary to validate these hypotheses. But the point is, these hypotheses are testable, since all hypothesised features and effects are in principle observable, if one has access to the underlying model. In particular, internal states of the portfolio model, such as the value of the assets or the value of certain liabilities, could be included as supplementary information. This additional information could then be used to explicitly define new features for improved predictions. Such reconciliation of properties of the prediction model with properties of the underlying data generating process could provide a more complete and conclusive causal interpretation and ultimately an explanation of what is going on.
+
+# References

@@ -1,0 +1,884 @@
+---
+title: "Use Case 'Insurance SCR' - Tail analysis"
+author: "gg"
+date: "`r Sys.Date()`"
+bibliography: ["./literatur/references.bib"]
+link-citations: yes
+output: 
+  bookdown::html_document2:
+    highlight: rstudio 
+    toc: true
+    number_sections: yes
+    toc_depth: 2
+toc-title: "Table of Contents"
+---
+
+```{css, echo = FALSE}
+body{
+  font-size: 12pt;
+}
+```
+
+\newcommand{\v}[1]{\mathbb{V}{\left[#1\right]}}
+\newcommand{\expect}[1]{\mathbb{E}{\left[#1\right]}}
+\newcommand{\charfun}[1]{\mathbf{1}\{#1\}}
+\newcommand{\RR}{\mathbb{R}}
+\newcommand{\PP}{\mathbb{P}}
+\newcommand{\prob}[1]{\mathbb{P}{\left[#1\right]}}
+\newcommand{\bigtimes}{\mathop{\Large\times\normalsize}}
+
+\newcommand{\VaR}[1]{\text{VaR}{\left[#1\right]}}
+
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+knitr::opts_chunk$set(echo=TRUE, cache = TRUE, cache.comments=FALSE, 
+                      comment=NA, out.width="90%", attr.source=".numberLines")
+
+suppressPackageStartupMessages(library(knitr))
+suppressPackageStartupMessages(library(kableExtra))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(splines))
+suppressPackageStartupMessages(library(mgcv))
+suppressPackageStartupMessages(library(gratia))
+suppressPackageStartupMessages(library(metR))
+suppressPackageStartupMessages(library(xgboost))
+suppressPackageStartupMessages(library(waterfalls))
+```
+
+# Abstract
+
+This report continues the analysis of the Use Case Insurance SCR. Instead of describing and explaining the global behaviour of the regression function as was done in the reports on variance decomposition, here, the focus is entirely on the tails, i.e. the extreme values, of the function.
+
+# Introduction
+
+There are several reasons why the analysis and explanation of tails is relevant:
+
+  * Tails, as large losses, are natural objects of interest for actuaries in general and risk managers in particular. The original use case "Insurance SCR" is a good example. Its whole raison-d'être is measurement of tail events by least squares Monte Carlo.
+  * Tails are - by definition - regions where data is scarce. This makes modelling more challenging and raises difficult questions on extrapolation properties.
+  * Issues, such as those mentioned above, have not been broadly addressed yet. Much of machine learning still is in the big-data domain, which is about best-estimate and prediction based on global averages of loss functions, such as mean square error.
+  * Machine learning does distinguish between local and global explanations, but tails are in-between these categories and may not fit easily into either one. This is all the more interesting, since many methods developed in this report may be applied not only to tail regions but to "regions of particular interest" in general.
+
+In this report tail analysis is performed by
+
+  - Visualisations, one and two dimensional, tailored in various ways to refer to and explain the tail.
+  - Comparison of key statistics between tail and non-tail regions
+  - Allocation of tail functionals, so called risk-measures, similar to well-known variable importance measures.
+
+
+## Initialisation {#init}
+
+In this report a semi-parametric additive model is used. While most methods are model agnostic, allocations of risk measures work better with additive models.  
+
+```{r, init}
+# seed for reproducibility
+set.seed(4711)
+datadir = "./data/"
+
+# number of portfolio (change this to 2 or 3 on your own risk)
+ipf = 1
+
+# data (.csv) files
+fnm_xall = paste0(datadir, "Portfolio", ipf, "/train_input.csv")
+fnm_yall = paste0(datadir, "Portfolio", ipf, "/train_result.csv")
+
+xall = as.matrix(read.csv(fnm_xall)[,-1])
+
+nxall = dim(xall)[1]
+nrf = dim(xall)[2]
+# names of input variables
+nm_x = paste0("x", seq.int(1,nrf))
+colnames(xall) = nm_x
+
+# prepare response aka y
+yall = as.matrix(read.csv(fnm_yall)[,-1])
+
+# size of training design
+dessize = 3000
+
+idxdes = sample.int(nxall, dessize, replace = FALSE)
+x = xall[idxdes,]
+y = yall[idxdes]
+
+relvar = c(1, 5, 6, 7, 13)
+
+# define formula for the interactions
+k_val = rep(5, nrf)
+k_val[relvar] = 11
+ti_terms = paste0("ti(", nm_x, ", k=", k_val, ")" )
+tm_main = paste(ti_terms, collapse = "+")
+
+# 2dim interactions
+idxpair = which(lower.tri(matrix(0, nrf, nrf)), arr.ind = TRUE)
+flg = idxpair[,2] %in% relvar
+tm_inter = paste(
+  "ti(", nm_x[idxpair[flg ,1]], ",", nm_x[idxpair[flg ,2]], ")", 
+                 collapse = " + ")
+tm_inter = paste0(tm_inter, " + ti(x1, x7, x13)")
+tm = paste0(tm_main," + ", tm_inter)
+fml = as.formula(paste0("y~", tm))
+
+# fit the semi-parametric additive model
+dfin = as.data.frame(cbind(y, x))
+md_bam = bam( formula = fml, data = dfin, discrete = TRUE)
+
+# model prediction on all data
+f = predict(md_bam, newdata=as.data.frame(xall))
+```
+
+
+# Tail definition
+
+Different possibilities exist for the definition of "tail". The first decision is between lower and upper tail, i.e. the focus on very low or very high values of the target functions. In this report we will focus exclusively on the lower tail for two reasons. First, this is the more interesting one from the perspective of the use case. Low values mean losses and losses are relevant  for risk management. Second, it is more challenging, as the lower tail is more volatile. But all methods and analysis in this report will work in exactly the same way, if one would consider the upper tail.
+
+In addition to the decision between lower and upper tail, one has to define a cut-off, i.e. the value beyond which scenarios are considered tail events. Since absolute values have little significance in the context of the use case, this cut-off is defined as a tail probability. In this report we use the empirical measure induced by the dataset to determine the probability. In real applications, a different measure, the so-called "real world distribution" of the risk factors, would be used. This data is not available in the use case, but the methods and concepts described here are agnostic to the measure employed, which means they would all apply equally to the real world distribution.
+
+In theory any cut-off could be used, and there is no reason to stick to any specific single choice. From the use case perspective, extreme tail events, related to outcomes at 1% or even more extreme such as 0.5% are the most interesting ones. But this conflicts with the limited number of samples available, which makes modelling the tails more relying on the extrapolation properties of the models (their so-called "inductive bias" [@wiki_IB])  than on any predictive qualities. We compromise by choosing a moderately extreme cut-off probability.  
+
+```{r}
+# define tail
+alpha = 5/100
+```
+
+Tails are defined in terms of the underlying dataset as those inputs and responses, i.e. datasets $(y,x)$ respectively $(f,x)$ such that their values of $y$ or $f$ are in the smallest `r alpha` of all possible outcomes. For a sample of size $N$ with sorted ascending function values $f_{(1)}, f_{(2)}, \ldots, f_{(N)}$ one defines $t(\alpha) = f_{(\lfloor\alpha * N\rfloor)}$ and the lower $\alpha$-tail of $f$ as
+
+$$T_f(\alpha)=\left\{ (x, f) \mid f(x)\leq t(\alpha)\right\}.$$
+In exactly the same way one can define $T_y(\alpha)$ as the lower $\alpha$-tail of $y$.
+
+Besides choosing upper or lower tail and the cut-off tail probability one has to decide which target function should define the tail. Seen from the perspective of the application the tail of $\check{f} = \expect{y \lvert X_1,\ldots,X_d}$, i.e. the tail of the true regression function should be the target. But, this tail is unobservable and we are stuck with either the noisy realisations $y$ or the values of the approximation $f$. The two tails are quite different, as a simple comparison reveals. 
+
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+
+# alpha quantile
+ntail = floor(alpha * nxall)
+
+sf = sort(f)
+sy = sort(yall)
+
+talpha_y = sy[ntail]
+talpha_f = sf[ntail]
+
+# tail flags 
+flg_ytail = (yall <= talpha_y)
+flg_ftail = (f <= talpha_f)
+
+# classification
+# 1) non-Tails agree
+res=rep(0,4)
+flg_nta = (!flg_ytail) & (!flg_ftail)
+res[1] = sum(flg_nta)
+# 2) tail agree
+flg_ta = (flg_ytail) & (flg_ftail)
+res[2] = sum(flg_ta)
+# 3) y-tail but not f-tail
+flg_ynotf = (flg_ytail) & (!flg_ftail)
+res[3] = sum((flg_ytail) & (!flg_ftail))
+# 4) f-tail but not y-tail
+flg_fnoty = (!flg_ytail) & (flg_ftail)
+res[4] = sum((!flg_ytail) & (flg_ftail))
+df = data.frame(
+  text = c("$f$ and $y$ agree: non-tail", "$f$ and $y$ agree: tail",
+           "$f$ tail, $y$ non-tail", "$y$ tail, $f$ non-tail"),
+  absolute = res, 
+  percentage = round(res / sum(res) * 100, 1))
+kable_styling(kable(df, caption = "differences in tail classification between $y$ and $f$"
+          ), bootstrap_options = "striped", full_width = F)
+```
+
+The number of `r res[3]` $f$-scenarios respectively $y$-scenarios which are classified differently is not insubstantial when compared to the only `r ntail` tail scenarios overall. (Notice that a $f$-tail scenario either agrees or disagrees with the classification of a $y$-scenario. This is why "f and y agree: tail" and "f tail, y non-tail" have to add up to the total number of tail scenarios. The same is of course true for $y$. Furthermore, since the number of $y$ and $f$ scenarios in "f and y agree: tail" is obviously equal for $y$ and $f$ the number of disagreements, i.e. "f tail, y non-tail" and "y tail, f non-tail" have to be equal as well.)  
+
+One obvious cause for differences, is a poor fit of $f$. If this were the only cause, it would be a good reason to choose the $y$-tail in favour of the $f$-tail. But there is an additional reason for a systematic difference: The tail bias of $y$. Remember that $y$ consists of two components the regression function $\check{f}$ and the error term $\epsilon$ such that $y=\check{f} + \epsilon.$ Owing to this fact there are two possible reasons  for $y$ being so small that it ends up in the tail: $\check{f}$ can be small or $\epsilon$ may be small as well. By conditioning on small values of $y$ one selects with higher probability negative values of $\epsilon$ with the result that 
+$$ \expect{\epsilon\vert y \leq t(\alpha)} < 0$$ 
+This means that estimates of $y$ are also biased low. This effect becomes stronger the further one goes into the tail.
+
+The two potential causes, lack of fit and tail bias, cannot be easily disentangled. But some evidence is provided by the following q-q plots of $f$ versus $y$. If the tails of $f$ and $y$ were equal, the black dots would be perfectly aligned along the red line $y=x.$ 
+
+```{r}
+# qqplot y and f
+df = data.frame(f = sf, y = sy)
+ggplot(df, aes(x = f, y = y)) + geom_point() + 
+  geom_abline(intercept = 0, slope = 1, colour="red") +
+  theme(aspect.ratio=1) +
+  theme_bw()
+```
+
+In the body of the q-q plot the agreement is very good, it diverges only at the ends. It is below the line at the lower and above at the upper tail. Furthermore the effect is stronger in the lower than in the upper tail. This is consistent with the deviation being driven by the volatility of $\epsilon$. This volatility should drive $y$ values down in the left but up in the right tail and is indeed much larger in the left, than in the right tail. 
+
+This effect of ever increasing systematic down-bias becomes even better visible when zooming in on the left tail.
+
+```{r}
+sftail = sort(f[flg_ftail])
+sytail = sort(yall[flg_ytail])
+df = data.frame(f = sftail, y = sytail)
+print(
+  ggplot(df, aes(x = sftail, y = sytail)) + geom_point() + 
+    geom_abline(intercept = 0, slope = 1, colour="red") +
+    theme_bw()
+)
+```
+
+The presence of tail bias is the reason for only using the $f$-tail in this report. This tail is from now on denoted by $T(\alpha).$
+
+
+# One dimensional analysis
+
+## Simple stress analysis {#stress}
+
+Simple stress analysis is arguably the most common and popular approach to tail analysis within finance and insurance. Starting with a base scenario, one "stresses", i.e. changes, a single input variable until it reaches either the boundary of its domain of definition or some pre-defined extreme displacement value. A paradigmatic application is the Solvency II standard model, which uses just a set of such displacements. The idea is straightforward and has been also used in other domains, where it has the name  *one factor at a time analysis* [@wiki_OF] or *ICE* [@molnar2022] Section 9.1. 
+
+The base scenario of stress analysis is completely arbitrary. The use case is parametrised in such a way that the Solvency II base scenario corresponds to the input value 0 for all inputs and we adopt this base scenario as well. The next figure shows the corresponding graphs of the model output $f$, when changing each input, on its own, from zero to its respective boundary values.
+
+```{r onedimstress, fig.cap="One dimensional stresses"}
+# limits of domain 
+xmin = apply(xall, 2, min)
+xmax = apply(xall, 2, max)
+
+# Base scenario is all zero
+x_0 = array(0, dim = c(1,nrf), dimnames = list(NULL, nm_x))
+f_0 = predict(md_bam, data.frame(x_0))
+
+# grid and predict all inputs
+
+#number of points to plot
+npt = 30
+
+sammler = list(f=NULL, x=NULL, variable=NULL)
+for(ivar in 1:nrf){
+  xgrid = array(0, dim = c( npt, nrf), dimnames = list(NULL, nm_x))
+  xgrid[,ivar] = seq(xmin[ivar], xmax[ivar], length.out=npt)
+  f_grid = predict(md_bam, data.frame(xgrid))
+  sammler = list(
+    f = c(sammler$f, f_grid), 
+    x =  c(sammler$x, xgrid[,ivar]),
+    variable=c(sammler$variable, rep(nm_x[ivar], npt))
+    )
+}
+
+# plot results
+dfplt = data.frame(sammler)
+plt = ggplot(dfplt, aes(x=x, y = f)) + 
+  geom_line(aes(colour=variable, group=variable, linetype=variable), linewidth=1.1 ) +
+  scale_colour_discrete(limits=nm_x) + 
+  scale_linetype_discrete(limits=nm_x) +
+  theme_bw()
+print(plt)
+
+```
+
+From the figure one observes that: 
+
+  * Each graph is monotonic in the inputs.
+  * Only the inputs $x_1$ and $x_7$ produce values sufficiently small to be tail relevant.
+  * Scenarios where $x_1$ and $x_7$ both are small may be potentially in the tail.
+
+
+## Naive ring fencing
+
+The simple structure of the stress scenarios suggests the idea, to find a tight box in input space, such that all tail scenarios are contained within this box. This would be an excellent explanation of the question: "Where is the tail?" 
+
+Expressed as a formula: For each input $x_i$ with $i=1,\ldots,d$ determine the smallest interval $I_i=[x_{i, lo}, x_{i,hi}]$ such that
+$$ T(\alpha)\subset \bigtimes_{i=1}^d I_i$$
+
+The next code block implements this for the scenarios of the input dataset.
+
+```{r}
+# find bounding box
+fbox_min = apply(xall[flg_ftail,], 2, min)
+fbox_max = apply(xall[flg_ftail,], 2, max)
+
+df = data.frame(`min all` = xmin, `box min` = fbox_min, `box max`=fbox_max, `max all` = xmax)
+kable_styling(kable(df, digits = 1), bootstrap_options = "striped", full_width = F)
+```
+
+The result is somewhat disappointing. The only variable where the bounding box is smaller than the total input space, is $x_7$. And even in this case, the interval required to cover all tail scenarios is $[-0.9, 0.2]$ which is a large part of $x_7$'s total input space $[-0.9, 1].$ Obviously the impression created by the stress scenarios, that all tail scenarios are in the region of small $x_1$ and $x_7$ values is incorrect.
+
+
+## Tail scatterplots{#tail}
+
+A simple and intuitive way to visualise the tail is to look at one-dimensional projections of $(f,x)$, i.e. the set of points $(f,x_i)$ for a single input variable $x_i.$ This is done in the following graphs where the tail is indicated by the large red dots.
+
+```{r}
+# variables to plot, see appendix for all others
+relvar = c(1, 2, 5, 6, 7, 13)
+nrel = length(relvar)
+
+# 1D scatter with coloured tail
+for(ivar in relvar){
+  plt = ggplot() +
+    geom_point(aes(x=xall[, ivar], y=f, colour=flg_ftail, shape=flg_ftail)) +
+    scale_colour_manual(values = c("black", "red"), name="Tail") +
+    scale_shape_manual(values = c(42, 16 ), name="Tail") +
+    geom_hline(yintercept=talpha_f, colour="red") +
+    theme_bw() +
+    ggtitle(paste0("Response vs variable:", nm_x[ivar])) +
+    labs(x = nm_x[ivar], y="f")
+
+  print(plt)
+}
+```
+
+Observations:
+
+  * Tail scenarios for the variable $x_2$ are quite uniformly distributed along all values of  $x_2$. The property "tail" or "non-tail" seems to have no influence on the distribution of $x_2.$ 
+  * This is not true for the other variables. The number/density of tail scenarios clearly depends on the value of the respective variable.
+  * But the cases of $x_5$ and $x_6$ may be borderline. From visual inspection only it is hard to see whether there is really any change.
+  * The distribution of tail scenarios as a function of $x_7$ is quite different from what one would expect from the stress scenarios. The distribution is not monotonic decreasing as $x_1$ or $x_{13}$ but has a pronounced maximum in the interior. 
+  
+*Remark: The scatter plots of the remaining other variables look more or less like the one for variable $x_2$ and are not shown. The interested reader may easily generate them by using the code block above with the proper parameters in the vector `relvar`.*
+
+
+## Tail CDF
+
+While scatter plots are intuitive and simple, they are not very quantitative, difficult to compare and can become bothersome, if one has to look at large numbers of them. This is why one may seek a further compression of the data contained in a scatter plot. One such way to compress the tail data is to just show the tail CDF of each input variable. This tail CDF is simply the CDF of the input conditional on the tail event, i.e. 
+
+$$ TCDF_i(x)=\expect{\charfun{X_i\leq x}\lvert T(\alpha)}=\PP[X_i\leq x \lvert T(\alpha)].$$
+
+This definition can be visualised by the following scatter plot for the variable $x_{13}.$
+
+```{r}
+
+ivar = 13
+xvalue = 0.25
+flg_lessthanx = (xall[,ivar] <= xvalue) & flg_ftail
+shapefactor = as.factor(flg_lessthanx + flg_ftail)
+tmp1 = paste0("tail and x", ivar," > ", xvalue)
+tmp2 = paste0("tail and x", ivar," <= ", xvalue)
+levels(shapefactor) = c("non-tail", tmp1, tmp2)
+plt = ggplot() +
+  geom_point(aes(x=xall[, ivar], y=f, 
+                 colour=shapefactor, shape=shapefactor, alpha=shapefactor)) +
+  scale_colour_manual(values = c("black", "red", "red"), name="Tail") +
+  scale_shape_manual(values = c(42, 1, 16), name="Tail") +
+  scale_alpha_manual(values = c(0.2, 1, 1), name="Tail") +
+  geom_hline(yintercept= talpha_f, colour="red") +
+  geom_vline(xintercept=xvalue, colour="black") +
+  theme_bw() +
+  ggtitle(paste0("Response vs variable:", nm_x[ivar])) +
+  labs(x = nm_x[ivar], y="f")
+
+print(plt)
+
+```
+
+The value of tail CDF $TCDF_{13}$ at the x-value `r xvalue` is just the number of tail scenarios with $x_{13}\leq$ `r xvalue` divided by the number of all tail scenarios. It can be easily calculated and plotted. This conditional CDF can then be compared to the unconditional CDF. The following set of figures shows the respective tail and non-tail CDFs for the relevant variables.
+
+```{r}
+for(ivar in relvar){
+  df = data.frame(x = c(xall[,ivar], xall[flg_ftail, ivar]), 
+                  CDF = as.factor(c(rep("uncond", nxall), rep("tail", ntail))))
+  print(
+    ggplot(df, aes(x, colour=CDF)) +
+      scale_colour_manual(values=c("red", "black")) +
+      stat_ecdf(geom = "step") +
+      labs(x=nm_x[ivar]) +
+      theme(aspect.ratio = 1) +
+      theme_bw()
+  )
+}
+```
+
+Observations:
+
+  * The distribution of variable $x_2$ is indeed largely independent from the tail. Its conditional and unconditional distribution are almost the same.
+  * In contrast the variable $x_5$ is clearly related to the tail. The tail CDF is quite distinct from the non-tail distribution. For example, more than 75% of all tail scenarios have a $x_5$ value below 0.5.
+  * The tail CDF for $x_7$ exhibits the strongest difference to its unconditional input distribution. The fact, established above, that all tail scenarios have $x_7\leq 0.2$ can be readily read-off the chart. Indeed already for $x_7\leq 0$ almost all tail scenarios are captured. Likewise the fact that almost all tail-scenarios are between $-0.5$ and $0$ is clearly visible.
+  
+In comparison to the simple stress graphs of Section \@ref(stress) the tail-CDF does not require an arbitrary base scenario and shows the impact of/on all tail scenarios and not just a single slice through the total graph. The definition of tail CDF can be extended in a straightforward way to include more than a single variable. Of course already two dimensional CDFs are no longer easy to visualise and higher dimensional analogues have even less intuitive appeal. 
+
+As before, the plots for the remaining variables are very similar to the one for $x_2$ and not shown.
+
+
+### Tail importance by Kolmogoroff-Smirnov
+
+At times information must be compressed even beyond the plot of (just) two CDFs, ideally into a single number per variable. One way to do this is to calculate the Kolmogoroff-Smirnov distance (see @wiki_KS) between the tail- and the unconditional distribution. This provides not only a handy summary and a first measure for tail-importance of input variables but also offers the chance to do formal hypothesis testing of the independence of an input from the tail.
+
+```{r KS}
+ksd = array(0, dim=c(nrel,1), dimnames = list(nm_x[relvar], NULL))
+ii = 1
+for(ivar in relvar){
+  df = data.frame(x = xall[,ivar], tail=flg_ftail, nontail = rep(1,nxall))
+  df = df[order(df$x),]
+  ecdf_tail = cumsum(df$tail) / sum(df$tail)
+  ecdf_nontail = cumsum(df$nontail) / sum(df$nontail)
+  ksd[ii] = max(abs(ecdf_tail - ecdf_nontail))
+  ii = ii + 1
+}
+
+df = cbind(rownames(ksd), data.frame(round(ksd,3), row.names=NULL))
+kable_styling(kable(df, 
+    caption = "Kolmogorov-Smirnov distance between Tail-CDF and unconditional CDF",
+    col.names = c("Variable", "KS Distance")
+          ), bootstrap_options = "striped", full_width = F)
+```
+
+There do exist similar statistics for the comparison of higher dimensional CDFs. 
+
+
+## Tail event probability {#tail-event-prob}
+
+Another way to compare tail and non-tail scenarios, is to count the number of tail scenarios between two values of an input variable and relate this to all scenarios between the two values, as demonstrated in the next figure for variable $x13$. 
+
+```{r tevprob}
+
+ivar = 13
+xlo = 0.25
+xhi = 0.5
+flg_hilo = (xall[,ivar] >= xlo) & (xall[,ivar] <= xhi)
+shapefactor = flg_hilo
+shapefactor[flg_hilo & flg_ftail] = 2
+shapefactor = factor(shapefactor, labels = c("outside", "inside & non-tail", "inside & tail"))
+
+plt = ggplot() +
+  geom_point(aes(x=xall[, ivar], y=f, 
+                 colour=shapefactor, shape=shapefactor, alpha=shapefactor)) +
+  scale_colour_manual(values = c("black", "blue", "red"), name="Tail") +
+  scale_shape_manual(values = c(42, 42, 16), name="Tail") +
+  scale_alpha_manual(values = c(0.2, 1, 1), name="Tail") +
+  geom_hline(yintercept= talpha_f, colour="red") +
+  geom_vline(xintercept=c(xlo, xhi), colour="black") +
+  theme_bw() +
+  ggtitle("Tail and non-tail events with a single fixed input") +
+  labs(x = nm_x[ivar], y="f") 
+
+print(plt)
+
+```
+
+This tail probability can be motivated in a non-technical way as the probability of picking a tail scenario at random if one input variable is fixed while all others can vary. In the limit $x_{i,lo}\rightarrow x_{i,hi}$ this is the probability of a tail scenario given the input $x_i$:
+
+$$ \tau_i(x) = \expect{ \charfun{T(\alpha)} \lvert X_i = x} 
+  = \PP\left[ T(\alpha) \vert X_i=x\right].$$
+
+In general these tail probabilities cannot be easily calculated from a dataset but need to be modelled. Here, we chose to model them using semi-parametric logistic regression.
+
+The next chart shows the tail probabilities conditional on the relevant variables.
+
+```{r onedteprob,warning=FALSE}
+
+pb_t = array(0, dim = c(nxall, nrel), dimnames = list(NULL, nm_x[relvar]))
+for(iidx in  1:nrel){
+  ivar = relvar[iidx]
+  dt = data.frame(y = flg_ftail, x = xall[,ivar])
+  md_logistic = glm("y ~ bs(x,df=10)", family = "binomial", dt)
+  pb_t[,iidx] = md_logistic$fitted.values
+}
+
+df = data.frame(variable = rep(nm_x[relvar], each=nxall), x= c(xall[,relvar]), prob=c(pb_t))
+
+print(
+  ggplot(df, aes(x=x, y=prob, group=variable, colour=variable, linetype=variable)) + 
+    scale_color_discrete(limits=nm_x[relvar], name = "variable") +
+    scale_linetype_discrete(limits=nm_x[relvar], name = "variable") +
+    geom_line(linewidth=1.5) +
+    coord_cartesian(ylim=c(0,0.25)) + 
+    ggtitle("One dimensional tail probabilities conditional on inputs") +
+    labs(x = "x", y="probability of tail scenario (tau_i(x))") +
+    theme_bw()
+)
+
+```
+
+All graphs are shown on a single common x-axis. The graphs have different starting points since the minimum values in the domains of definition differ for the various variables. The chart above can and should be compared to the scatter plots in Section \@ref(tail). 
+
+Conditional tail probabilities have two advantages over stress plots. First, no arbitrary base point has to be chosen. Second, stress graphs show definite values of $f$ but only along a single slice. In contrast tail probabilities are just a probability, but this probability is for the full graph. 
+
+
+# Two dimensional analysis
+
+While tail CDF and tail probability were introduced in the prior sections as functions of a single variable, it is no problem to define them for any set of conditioning variables, i.e. as functions of two, three ... or any number of variables. In addition to this being possible, it is also necessary for a sound analysis. The analysis of variable importance in the prior reports and the dependency between some of the inputs, notably the one between $x_1$ and $x_7$ show that at least a 2D analysis is required. This is true, even though 2D visualisation is already much more complicated and raises questions on modelling issues and visualisation decisions. This section will provide some examples for visual 2D analysis.
+
+## Simple stress analysis
+
+One approach to improve upon the simple stress analysis started in Section \@ref(stress) is to plot $f$ over a plane. The next code block implements this for the $x1$-$x7$ plane and shows the result in the figure below.
+
+```{r}
+ivar_1 = 1
+ivar_2 = 7
+x1vec = seq(xmin[ivar_1], xmax[ivar_1], length.out = npt)
+x2vec = seq(xmin[ivar_2], xmax[ivar_2], length.out = npt)
+xgrid = expand.grid(x1vec, x2vec)
+xqt = array(0, dim = c( npt^2, nrf), dimnames = list(NULL, nm_x))
+xqt[,ivar_1] =  xgrid[,1]
+xqt[,ivar_2] =  xgrid[,2]
+
+f_at_x = predict(md_bam, data.frame(xqt))
+
+plt = ggplot() +
+  
+  # geom_contour_fill(breaks = pbbrk) + 
+  geom_contour_fill(aes(x=xqt[,ivar_1], y=xqt[,ivar_2], z=f_at_x)) + 
+  
+  scale_fill_gradient2(
+    name="function value",
+    # low='Purple',mid='white',high='Orange',
+    low="red", mid="white", high = "black",
+    midpoint = f_0,
+    # breaks = pbbrk,
+  ) +
+
+  # geom_contour(colour = "black", breaks = pbbrk,
+  #              linewidth = 0.2, alpha = 0.5) +
+  
+  geom_contour(aes(x=xqt[,ivar_1], y=xqt[,ivar_2], z=f_at_x),
+               colour = "black",
+               linewidth = 0.2, alpha = 0.5) +
+  
+  # geom_text_contour(colour = "black",  breaks = pbbrk) +
+  
+  geom_text_contour(aes(x=xqt[,ivar_1], y=xqt[,ivar_2], z=f_at_x),
+                    colour = "black") +
+  labs(x = nm_x[ivar_1], y=nm_x[ivar_2]) +
+  
+  theme_bw() +
+  theme(aspect.ratio=1)
+
+plt = plt +  geom_point(aes(x=xall[,ivar_1], y=xall[,ivar_2]), 
+                        shape=".", alpha = 0.5, colour="blue")
+print(plt)  
+  
+```
+
+Note that the plot on its own may be misleading and its usefulness limited. As is usual for stresses they are performed independently, which means for this plot they are calculated on a rectangular grid (see line #5 in the code block above). This grid completely ignores the non-rectangular structure of the $(x_1, x_7)$ data, which was made visible here by overlaying a scatter (in blue) of the true dataset. From this, it is clear that the "true" tail is not reached for very low $x7$ values. Ignoring this constraint on the inputs leads to completely unrealistic tail values. Some of the other planes show similar but less pronounced behaviour, and are not shown for simplicity     
+
+
+## Two dimensional tail event probability
+
+Next we show 2D plots of the tail event probability introduced in Section \@ref(tail-event-prob). We only show a limited selection of possible planes.
+
+```{r}
+# pairs for 2D
+relvar_2d = c(1,7,13)
+nrel_2d = length(relvar_2d)
+
+idxpair = which(lower.tri(matrix(0, nrel_2d, nrel_2d)), arr.ind = TRUE)
+relpair = cbind(relvar_2d[idxpair[,2]], relvar_2d[idxpair[,1]])
+npair = dim(relpair)[1]
+```
+
+
+```{r tailprobplot}
+for(ipair in 1:npair){
+  varpair = relpair[ipair,]
+  nm_pair = nm_x[varpair]
+  dt = data.frame(y = flg_ftail, xall[, varpair])
+  fm = as.formula(
+    paste0("y ~ ti(", nm_pair[1], ") + ti(", nm_pair[2], 
+           ") + ti(", nm_pair[1], ",", nm_pair[2], ")" ))
+  md = gam(fm, family = "binomial", dt)
+  df = data.frame(probability=md$fitted.values, xall[,varpair])
+  print(
+    ggplot(df, aes(x = df[,nm_pair[1]], y = df[,nm_pair[2]], colour=probability)) + 
+      geom_point() +
+      # individual prob scale
+      scale_color_gradient2(low="black",mid='white',high='red', midpoint = 0.05) +               
+      
+      labs(x=nm_pair[1], y=nm_pair[2]) +
+      theme_bw()
+  )
+}
+```
+
+In the graphs above, the "neutral" probability of `r alpha*100`% is white, higher probabilities are red, lower ones grey. Note from the legends that the scales and the colour saturation differs between the graphs.
+
+Again, different from the scenario plot, this is not just a 2D slice through the high-dimensional graph, but the full picture.
+
+The $x_1$-$x_7$ plot nicely reconciles the two slightly paradoxical facts of bad scenarios having joint low $x_1$ and low $x_7$ with the 1D-scatter of $x_7$ where the majority of tail scenarios is in $[0,-0.5]$.
+
+
+# Unusual scenarios
+
+The general knowledge obtained in the prior sections about the structure and location of the tail can now be used to make a targeted search for "unusual" scenarios. An unusual scenario is defined as 
+
+  - either a non-tail scenario in a region with high tail probability 
+  - or the opposite, i.e. a tail scenario in a low tail probability region.  
+
+Such scenarios are potentially useful for explainability. Because they are edge cases, they denote scenarios where models may break down or they nay further the general understanding of the model under unusual circumstances.
+
+The next code block finds some non-tail scenarios in a region which has a high tail probability. We use information from the 2d $(x_1, x_7)$ tail probability plot above and choose first, some cut-off values for $x_1$ and $x_7$ with high probability of tail events. Afterwards the scenarios with $x_1$, $x_7$ values more extreme than the cut-offs are filtered for non-tail events.
+
+```{r}
+
+# non-tail in high tail prob region
+x7lim = -0.3
+x1lim = -0.75
+flg = (xall[,1] <= x1lim) & (xall[,7] <= x7lim) & (!flg_ftail)
+tmp = paste0("Unusual non-tail scenarios for x1 <= ", x1lim, " and x7 <= ", x7lim)
+df = data.frame(f=f[flg], xall[flg,])
+kable_styling(kable(df[order(df[,"f"]),], caption = tmp, digits=2, 
+                    row.names = F), 
+              bootstrap_options = "striped", full_width = F)
+
+# same data but expressed in percentile ranks
+rkmat = apply(cbind(f,xall), 2, rank) / nxall * 100
+colnames(rkmat) = colnames(df)
+df = round(rkmat[flg,],0)
+kable_styling(kable(df[order(df[,"f"]),], caption = "Unusual non-tail scenarios by percentile ranks", row.names = F), bootstrap_options = "striped", full_width = F)
+```
+
+The first figure shows the values of inputs and $f$, the second one their respective ranks. Showing ranks is preferable since this makes the results easier to compare and interpret (e.g. the value 5 for $f$, means this value is right at the tail boundary of 5%). Note that all percentage values are rounded for convenience. These scenarios reveal again why the boxing-in idea was doomed to fail. A simple rule which does not take the joint impact of inputs into account  is not able to define the tail/non-tail boundary with any accuracy. Another consequence of the importance of interactions, is the limited amount of information obtainable from stress approaches, where only a single risk factor is considered in isolation.
+
+While tail scenarios in regions with low tail probability could be found in the same way as above (i.e. cut-off at some input values and filter), we demonstrate next a different selection approach. A "tail-score" is defined as the average of the ranks of the most influential inputs (here $x_1$, $x_7$ and $x_{13}$). This score is then used to select two scenarios, a tail-scenario and a non-tail scenario. One is the non-tail scenario with smallest tail-score which is called "min" and the tail scenario with largest tail-score, called "max".
+
+```{r}
+score_t = rowSums(rkmat[,c(1, 7, 13)]) / 3
+idx_tail = which(flg_ftail)
+idx_nontail = which(!flg_ftail)
+score_max = idx_tail[which.max(score_t[flg_ftail])]
+score_min = idx_nontail[which.min(score_t[!flg_ftail])]
+
+df = data.frame(kind=c("max", "min"), data.frame(rkmat[c(score_max, score_min),]))
+kable_styling(kable(df, digits = 0, row.names = F,
+  caption = "Max Min scores (percentile ranks)"), bootstrap_options = "striped", full_width = F)
+```
+
+The table again shows the diversity of possible tail constellations caused by the compensation effects between inputs. I.e. where a particularly bad input in one variable gets compensated by very large inputs from other variables. Of course, the equally weighted score of three inputs is just one way of slicing and dicing the input space. Other scores can be used should based on the questions about the underlying insurance portfolio model and prior knowledge about the influence of the risk factors on this model.
+
+
+# Allocation approaches
+
+Allocation methods have been studied extensively within finance and insurance, where this task is called "capital allocation". To bridge the gap between machine learning and the established terminology it is helpful to formalise the allocation problem slightly. This makes it easier to see the common structure. 
+
+Recall that a generic explainability-by-allocation method works as follows:
+
+  - choose a target functional of interest and apply it to the model to obtain a total value
+  - choose the "interesting" components of the model which shall be explained
+  - devise an algorithm which allocates the total value to the components.
+  
+Many explainability methods fit this pattern. Of those, the one most similar to capital allocation is variance allocation:
+
+  - Target functional: Variance
+  - Interesting components: The input values
+  - Algorithm: Functional ANOVA/Permutation Feature Importance or Shapley allocation.
+  
+Applying variance allocation to the tail region, i.e. to the set $T_\alpha(f)$, is possible and straightforward to do. But usually allocations focused on the tail use functionals such as Value At Risk ($\text{VaR}$)  or Expected Shortfall ($\text{ES}$) both at the $alpha$-level as target functional. To arrive at their usual interpretation as required capital a simple transformation is applied to $f$:
+
+  - To interpret the result as a "P&L" the value of a base scenario $f_0$ is subtracted from $f$.
+  - Reverse the sign, such that "losses", i.e. negative P&L values, are positive.
+
+$$\VaR{f} = - (t_\alpha(f) - f_0) \quad\text{ and }\quad\text{ES}[f]=-\expect{f - f_0\mid f <t_\alpha(f)}.$$
+
+
+## Allocation by stress approach
+
+This first example is very likely the most popular approach to report variable importance for risk measures. The total amount of a risk measure, VaR or Expected Shortfall, is allocated either onto  single variables or onto larger groups of inputs, such as all financial or biometric risks.
+
+Quite surprisingly and in spite of its popularity, the method itself neither has a generally accepted name nor is it standardised. Since there are many possible variations in detail, the approach presented here is a generic take on the three items making up an explanation-by-allocation. The approach works identical for VaR and Expected Shortfall. We start by describing the approach for VaR as the functional to be allocated. In both cases the targets of allocation are the univariate margins anchored at an arbitrary base point and written as a P&L. Here we follow Section \@ref(stress) and base the margins at $f_0 = (0,\ldots,0)$ , i.e.
+$$ f_i(X_i) = f(0,\ldots,0,X_i,0,\ldots,0) - f_0\quad\text{ with }i=1,\ldots,d.$$
+
+### Value at risk
+
+The amount allocated onto variable $x_i$ is then the Value at Risk of the function $f_i - f_0$ with respect to the marginal distribution of the variable $X_i$:
+$$ A_i = \VaR{f_i - f_0}.$$
+Of course in general the $A_i$ will not add up to the total $\VaR{f}$. But instead of scaling to 100% as is usually done for allocations which do not add up to the total, it is customary to show the difference. This difference has to components:
+
+  - One part is an approximation error. Since the one dimensional stresses do not add up to the original model an error term has to be considered: $$ f - f_0= \sum_{i=1}^d (f_i - f_0) + \text{ error }$$
+  - And a difference due to the difference between the distribution of the sum under the joint distribution and the sum of the marginal distributions which are used to calculate the respective values at risk.
+  
+The latter difference is also known as "diversification".
+
+```{r}
+# classic stress approach, Value at Risk
+
+# base case
+x_0 = array(0, dim=c(1, nrf), dimnames = list(NULL, nm_x))
+# we need f_0 for centring
+f_0 = predict(md_bam, newdata = data.frame(x_0))
+
+f_isum = numeric(nxall)
+
+A_i = numeric(nrf)
+for(ivar in 1:nrf){
+  # define subfunction
+  x_i = array(0, dim=dim(xall), dimnames = list(NULL, nm_x))
+  x_i[,ivar] = xall[,ivar]
+  # note the deduction of f_0 for centring
+  f_i = predict(md_bam, newdata = data.frame(x_i)) - f_0
+  # running sum to calculate the error 
+  f_isum = f_isum + f_i
+  talpha_i = sort(f_i)[ntail]
+  A_i[ivar] = - talpha_i
+}
+
+# allocation on the error
+# note the deduction of f_0 for centring
+f_err = f - f_0 - f_isum
+talpha_err = sort(f_err)[ntail]
+A_err = - talpha_err
+  
+#centred VaR of f
+cenvatr_f = -(talpha_f - f_0)
+df = data.frame( values=round(c(A_i, A_err, cenvatr_f - sum(A_i) - A_err ), 2), labels=c(nm_x,"error", "divers") )
+p = waterfall( df, calc_total = TRUE, total_axis_text = "VaR")
+print(p)
+```
+Observations:
+
+  - By far the largest part of the allocation is due to the non-linearity of VaR ("diversification") and not attributable to any input variable.
+  - The error term, which is also not attributable to any input, is also of considerable size in comparison to most other variables.
+  - The size of some contributions does not seem to be  plausible considering prior results. For example irrelevant variables such as $x_2$ and $x_{10}$ receive the same allocations as the more influential variable $x_{13}.$    
+  
+The advantages of this method are that it is easy to calculate and similar in spirit to the Solvency-II standard model. But it has the same problems as the simple stress analysis from Section \@ref(stress). For the use case example above, the univariate values at risk are very large, because the non-rectangular shape of the input region is ignored (the impossible data problem) and the negative correlation between $x_1$ and $x_7$ is not reflected. In total this allocation is mainly a quantitative summary of certain aspects of the graphs shown in Figure \@ref(fig:onedimstress).
+
+
+### One factor allocation
+
+One can set up the allocation onto one dimensional stress functions using Expected Shortfall in exactly the same way as for VaR, just exchanging the risk measure VaR with the risk measure expected shortfall. This is done in the code below. The only difference to the code block of the previous section is the different calculation of the functional.
+
+```{r}
+# classic stress approach, Expected Shortfall
+
+# base case
+x_0 = array(0, dim=c(1, nrf), dimnames = list(NULL, nm_x))
+# we need f_0 for centring
+f_0 = predict(md_bam, newdata = data.frame(x_0))
+f_isum = numeric(nxall)
+
+A_i = numeric(nrf)
+for(ivar in 1:nrf){
+  # define subfunction
+  x_i = array(0, dim=dim(xall), dimnames = list(NULL, nm_x))
+  x_i[,ivar] = xall[,ivar]
+  # note the deduction of f_0 for centring
+  f_i = predict(md_bam, newdata = data.frame(x_i)) - f_0
+  f_isum = f_isum + f_i
+  condex_i = mean(sort(f_i)[1:ntail])
+  A_i[ivar] = -condex_i
+}
+
+# allocation on the error
+# note the deduction of f_0 for centring
+f_err = f - f_0 - f_isum
+condex_err = mean(sort(f_err)[1:ntail])
+A_err = -condex_err
+  
+#centred ES of f
+condex_f = -mean(sort(f)[1:ntail] - f_0)
+df = data.frame( values=round(c(A_i, A_err, condex_f - sum(A_i) - A_err ), 2), labels=c(nm_x,"error", "divers") )
+p = waterfall( df, calc_total = TRUE, total_axis_text = "ES")
+print(p)
+```
+
+The actual numbers are (slightly) different, but the issues and possible insights are quite the same.
+
+
+### Euler Allocation of Expected Shortfall
+
+But this stand-alone fashion is by no means a natural way to allocate the total amount of a risk measure. For several practical and theoretical reasons the so called Euler Allocation is much more preferable (see [@Tasche] for technical details and [@gg] for applications). The following section implements this allocation. 
+
+```{r}
+# classic stress approach, Euler allocation
+
+# base case
+x_0 = array(0, dim=c(1, nrf), dimnames = list(NULL, nm_x))
+# we need f_0 for centring
+f_0 = predict(md_bam, newdata = data.frame(x_0))
+f_isum = numeric(nxall)
+
+A_i = numeric(nrf)
+for(ivar in 1:nrf){
+  # define subfunction
+  x_i = array(0, dim=dim(xall), dimnames = list(NULL, nm_x))
+  x_i[,ivar] = xall[,ivar]
+  # note the deduction of f_0 for centring
+  f_i = predict(md_bam, newdata = data.frame(x_i)) - f_0
+  f_isum = f_isum + f_i
+  condex_i = mean(f_i[flg_ftail])
+  A_i[ivar] = -condex_i
+}
+
+# allocation on the error
+# note the deduction of f_0 for centring
+f_err = f - f_0 - f_isum
+condex_err = mean(f_err[flg_ftail])
+A_err = -condex_err
+  
+#centred TCE of f
+condex_f = -mean(f[flg_ftail] - f_0)
+df = data.frame( values=round(c(A_i, A_err, condex_f - sum(A_i) - A_err ), 2), labels=c(nm_x,"error", "divers") )
+p = waterfall( df, calc_total = TRUE, total_axis_text = "TCE")
+print(p)
+```
+
+The difference in calculation may be subtle yet the outcome is very different. In the prior calculation of expected shortfall, each stress function was calculated as a stand-alone variable in particular the conditioning was with respect to the tail of $f_i$:
+$$ \text{ES}[f_i]=\expect{f_i\lvert f_i\leq t_\alpha(f_i)}$$.
+
+But in the latter calculation conditioning is performed with respect to the tail of $f$. Now the expectation is actually additive:
+$$ \expect{f\lvert f\leq t_\alpha(f)} 
+  = \expect{\sum_i f_i\lvert f\leq t_\alpha(f)} 
+  =  \sum_i \expect{f_i\lvert f\leq t_\alpha(f)}.$$
+  
+This leads to the "diversification" term being zero and the allocation being additive. Additivity is often considered a basic requirements of allocations. To emphasize this difference between the functionals, this functional will be called in the following *Tail Conditional Expectation* or TCE.
+
+Further observations:
+
+  - The allocations are not always positive.
+  - The error term is very small. This is probably because the expectations are calculated on the actual tail scenarios, which mitigates the impossible data issue to a certain extent.
+  - Many contributions are (very close to) zero, which makes sense in light of the prior findings. We know already that these variables are stochastically independent of the tail.
+  
+  
+## Alternative additive allocations
+
+While the stress approach with stand-alone risk measures is popular it is of limited usefulness. The first reason is the non-additivity, which can be remedied by the Euler Allocation. Euler Allocation is also possible for VaR and will be presented in the next section. More difficult to resolve is the decomposition problem. Allocations are possible only if the underlying model is additive. But the additive decomposition of $f$ into stress functions has three problems:
+
+  - This decomposition may have a large error.
+  - It is quite arbitrary, in particular the base scenario is completely arbitrary.
+  - It is unrelated to the underlying business reality which it is supposed to reflect.
+  
+This is in stark contrast to the classic setting of capital allocation, where the allocation is performed on portfolios of (re)insurance contracts, financial assets or lines of business. In all these cases the function $f$ itself is already the sum of uniquely identifiable elements which have a direct relevance to business. But the function of this use case is not of this simple structure. While there are underlying portfolios of assets and insurance policies, their cash flows are transformed by non-additive financial guarantees and management rules. Exactly this phenomenon makes the sophisticated modelling necessary in the first place.     
+
+This means, for allocation purposes it is not sufficient to have a good model, one has to have a good additive model, with the three properties:
+
+  - The additive model is a good approximation to the available data.
+  - It is non-arbitrary, identifiable and unique.
+  - It must be related or at least be relatable to the underlying business reality it is supposed to model.
+
+Currently, no completely satisfying solution having all three properties is known. In [@gg] an approach using optimal hedging is suggested. But this approach is not possible in general, it applies only if an appropriate pool of hedge instruments or (re)insurance contracts is defined. In this use case, we do not even know the particular risk factors and we have to choose a more synthetic/theoretical approach to demonstrate the underlying ideas and challenges.
+
+Here, we rely on the fact that the fitted model is actually an additive model (see the code in Section \@ref(init) for the details) and that we have access to its components.
+
+```{r decompose}
+tce = - mean(f[flg_ftail]) + md_bam$coefficients["(Intercept)"]
+
+# pick apart the model
+nm_smooth = smooths(md_bam)
+nsmooth = length(nm_smooth)
+tcevec = numeric(nsmooth)
+names(tcevec) = nm_smooth
+for(ism in 1:length(nm_smooth)){
+  tt = smooth_estimates(md_bam, 
+                        select = nm_smooth[ism], data = as.data.frame(xall))
+  tcevec[ism] = -mean(tt$.estimate[flg_ftail])
+}
+
+# sort according to importance
+stcevec = tcevec[order(tcevec, decreasing = TRUE)]
+flg = (abs(stcevec) > 2e-2)
+tmp = sum(stcevec[!flg])
+df = rbind(data.frame(TCE=stcevec[flg], Term = names(stcevec[flg])),
+           data.frame(TCE=tmp, Term = "other"),
+           data.frame(TCE=sum(stcevec), Term = "total"))
+df$`rel. (%)` = round(df$TCE / sum(stcevec) * 100,1)
+df$TCE = round(df$TCE, 2)
+kable_styling(kable(df[,c(2,1, 3)], row.names = FALSE), 
+              bootstrap_options = "striped", full_width = F)
+# waterfall
+tmp = df[-dim(df)[1],c("Term", "TCE")]
+colnames(tmp) = c("labels", "values")
+p = waterfall( tmp, calc_total = TRUE, total_axis_text = "TCE")
+print(p)
+```
+
+Note, that this is not an allocation on input variables, but on the terms which make up the additive model. As the model is semi-parametric each component is a tensor-product spline with respect to the respective input variables. The terms with the largest allocation are shown and include main and interaction terms. It is not possible to split allocations on interactions in a non-arbitrary way between the input variables. An obvious requirement to avoid ambiguity is to subtract the intercept, which is identical to the expectation. This was done in the table above. 
+
+The additive model used in the calculations is unique only in the practical sense that the fitting algorithm produces one unique model. The decomposition is not unique when allowing other algorithms and other additive decompositions are possible and will lead to different terms and different allocations. This situation is quite different to variance allocation with independent inputs, where the decomposition could be justified due to its mathematical uniqueness based on orthogonality. This is natural and necessary if one allocates variance. There is no analogous requirement or justification in the case of TCE allocation.
+
+
+## Euler allocation of VaR
+
+As explained in [@Tasche] for the Value at Risk the Euler allocations $A_i$ onto the components of an additive model $f=\sum_i f_i$ are
+$$ A_i = \expect{f_i \lvert f=t_\alpha(f)}.$$
+
+This allocation is quite similar to the Euler allocation of Expected Shortfall, but it  differs in the conditioning. Here, the conditioning has to be performed on a set of measure zero. This creates practical problems, when estimating by Monte-Carlo, since it is often impossible to generate random numbers from the conditional distribution. A work around often found in practice is to broaden the conditioning slightly by introducing an approximation based on a small $\delta>0$ and to sample conditional to the set $t_\alpha(f) - \delta \leq f \leq t_\alpha(f) + \delta$ by acceptance-rejection sampling from the underlying distribution. But for this use case even this work around is impossible, since we are limited to the fixed available dataset.
+
+# References

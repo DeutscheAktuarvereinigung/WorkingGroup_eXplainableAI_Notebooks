@@ -1,0 +1,602 @@
+---
+title: "Use Case 'Insurance SCR' - Non-Parametric models"
+author: "gg"
+date: "`r Sys.Date()`"
+bibliography: ["./literatur/references.bib"]
+link-citations: yes
+output: 
+  bookdown::html_document2:
+    highlight: rstudio 
+    toc: true
+    number_sections: yes
+    toc_depth: 2
+---
+
+\newcommand{\v}[1]{\mathbb{V}{\left[#1\right]}}
+\newcommand{\expect}[1]{\mathbb{E}{\left[#1\right]}}
+\newcommand{\RR}{\mathbb{R}}
+
+# Introduction
+
+This report introduces two non-parametric models. Boosted trees as provided by the [`XGBoost`](https://xgboost.readthedocs.io/en/stable/index.html)library and Gaussian Process Regression. Except for the new models, the structure of this analysis follows the template set out for linear models very closely. The task is again feature importance by variance respectively $R^2$ attribution and consists mainly of the steps:
+
+  * Initialisation and hyperparameter definition.
+  * Test of in sample and out of sample fit.
+  * Calculation of the main and total Sobol indices for independent inputs.
+  * Variance attribution on selected inputs by the Shapley algorithm.
+
+# Boosted trees  
+
+## Initialisation and choice of hyperparameters  
+
+The initialisation block is similar to the one in the two prior reports.  
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo=TRUE, cache = TRUE, cache.comments=FALSE, 
+                      comment=NA, out.width="90%", attr.source=".numberLines")
+
+suppressPackageStartupMessages(library(knitr))
+suppressPackageStartupMessages(library(kableExtra))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(waterfalls))
+suppressPackageStartupMessages(library(sensitivity))
+suppressPackageStartupMessages(library(DiceKriging))
+suppressPackageStartupMessages(library(xgboost))
+
+# seed for reproducibility
+set.seed(4711)
+datadir = "./data/"
+
+# Number of portfolio (change this to 2 or 3 on your own risk)
+ipf = 1
+
+# data (.csv) files
+fnm_xall = paste0(datadir,"Portfolio", ipf, "/train_input.csv")
+fnm_yall = paste0(datadir,"Portfolio", ipf, "/train_result.csv")
+
+xall = as.matrix(read.csv(fnm_xall)[,-1])
+
+nxall = dim(xall)[1]
+nrf = dim(xall)[2]
+# names of input variables
+nm_x = paste0("x", seq.int(1,nrf))
+colnames(xall) = nm_x
+
+# prepare response aka y
+yall = as.matrix(read.csv(fnm_yall)[,-1])
+
+# size of training design
+# dessize 1000: too quick to grab a coffee
+# dessize 2000: grab a coffee
+# dessize 4000: go for lunch, grab a coffee, have a chat 
+dessize = 2000
+
+# number of bootstrap iterations for confidence intervals
+nboot = 50
+```
+
+The following set of hyperparameters is used for XGBoost.
+
+```{r}
+hparams = list( 
+  learning_rate = 0.1,
+  max_depth = 4,
+  min_child_weight = 30,
+  colsample_bytree = 1,
+  colsample_bylevel = 1,
+  colsample_bynode = 1,
+  subsample = 0.8,
+  reg_lambda = 1,
+  reg_alpha = 2,
+  min_split_loss = 1e-3
+)
+```
+
+These have been determined with limited effort in standard fashion using a randomised grid search but are probably not globally optimal.
+
+## Test of fit
+
+In the same way as for the linear models, in sample and out of sample fit as well as their variability is established by testing several independent subsets of the dataset.
+
+```{r}
+
+# number of iterations
+niter = 10
+rsq = array(Inf, dim=c(niter,3), dimnames = list(NULL, c("out", "in", "delta")) )
+for(iiter in 1:niter){
+  # select the points in the design
+  tmp = sample.int(nxall, 2 * dessize, replace = FALSE)
+  idxtmp = tmp[1:dessize]
+  xtmp = xall[idxtmp,]
+  ytmp = yall[idxtmp]
+
+  # test data for out-of-sample
+  idxtest = tmp[-(1:dessize)]
+  xtest = xall[idxtest,]
+  ytest = yall[idxtest]
+
+  # fit the model on xtmp, select from this 80/20 for train/test
+  idxtrain = sample.int(dessize, 0.8 * dessize, replace = FALSE)
+
+  xtrain = xtmp[idxtrain,]
+  ytrain = ytmp[idxtrain]
+  dtrain = xgb.DMatrix(xtrain, label = ytrain)
+
+  xvali = xtmp[-idxtrain,]
+  yvali = ytmp[-idxtrain]
+  dvali = xgb.DMatrix(xvali, label = yvali)
+
+  md = xgb.train(
+    verbose = 0,
+    params = hparams,
+    data = dtrain,
+    watchlist = list(train = dtrain, valid = dvali),
+    nrounds = 1000,
+    early_stopping_rounds = 20
+  )
+
+  # calculate Rsquareds
+  ypred = predict(md, newdata = xgb.DMatrix(xtrain))
+  rsq[iiter,"in"] = 1 - mean((ytrain - ypred)^2) / var(ytrain)
+  ypred = predict(md, newdata = xgb.DMatrix(xtest))
+  rsq[iiter, "out"] = 1 - mean((ytest - ypred)^2) / var(ytest)
+}
+
+rsq[,"delta"] = rsq[, "out"] - rsq[,"in"]
+rsq = rbind(rsq,colMeans(rsq))
+row.names(rsq) = c(rep("",niter), "mean")
+kable_styling(kable(rsq*100, digits = 1),
+              bootstrap_options = "striped",
+              full_width = F)
+```
+
+The mean performance is an $R^2$ of `r round(rsq["mean",1] * 100,1)`% which is somewhat disappointing given that this is slightly worse than the performance of the linear model with quadratic features. Certainly, readers are welcome to improve on this with more sophisticated hyperparameter optimisation or making use of additional capabilities of the `XGBoost` package such as monotonic or interaction constraints. 
+
+The substantial difference between in and out of sample fit indicates overfitting. Accordingly, and unless explicitly stated otherwise all variable importance will be performed out of sample.
+
+
+## `XGBoost`'s in-built variable importance
+
+`XGBoost` comes with an inbuilt variable importance measure.
+
+```{r}
+
+# refit single model for clarity
+idxdes = sample.int(nxall, dessize, replace = FALSE)
+idxtrain = sample.int(dessize, 0.8 * dessize, replace = FALSE)
+
+x = xall[idxdes,]
+y = yall[idxdes]
+
+xtrain = x[idxtrain,]
+ytrain = y[idxtrain]
+dtrain = xgb.DMatrix(xtrain, label = ytrain)
+
+xvali = x[-idxtrain,]
+yvali = y[-idxtrain]
+dvali = xgb.DMatrix(xvali, label = yvali)
+
+md = xgb.train(
+  verbose = 0,
+  params = hparams,
+  data = dtrain,
+  watchlist = list(train = dtrain, valid = dvali),
+  nrounds = 10000,
+  early_stopping_rounds = 20
+)
+
+# variable importance in-built
+tt = xgb.importance(model = md)
+idx = match(nm_x, tt$Feature)
+df = data.frame(values = round(tt$Gain[idx] * 100,1), 
+                labels=c(tt$Feature[idx]) )
+print(waterfall( df, calc_total = TRUE, total_axis_text = "???"))
+```
+
+Somewhat surprisingly, it is quite difficult to find out what is actually calculated. `XGBoost's` documentation only tells us:
+
+> Gain is the improvement in accuracy brought by a feature to the branches it is on. The idea is that before adding a new split on a feature X to the branch there was some wrongly classified elements, after adding the split on this feature, there are two new branches, and each of these branch is more accurate (one branch saying if your observation is on this branch then it should be classified as 1, and the other branch saying the exact opposite).
+
+Apparently, the only way to obtain more information is to study the source code, see e.g. this [answer](https://stats.stackexchange.com/questions/162162/relative-variable-importance-for-boosting/163673) to a question on Cross validated.
+
+Most likely the feature importance of XGBoost is a normalised version of the standard "mean decrease in impurity". [The SciKit-learn documentation warns against using this measure](https://scikit-learn.org/stable/modules/ensemble.html#random-forest-feature-importance) and contains some [illuminating examples](https://scikit-learn.org/stable/auto_examples/inspection/plot_permutation_importance.html#sphx-glr-auto-examples-inspection-plot-permutation-importance-py) for classification.  
+
+To summarise, this measure seems to have the following issues:
+
+  * The method is not documented.
+  * It is not clear to what observable quantity of the model the importances ultimately relate.
+  * It is apparently based on training data, which as we have seen is prone to overfit.
+  * As we cannot rely on any mathematical framework, it is not clear how basic phenomena such as correlations or even the cardinalities of input values influence the results.
+
+
+## Sobol indices
+
+Next follows the calculation of the main and total Sobol indices. The same restrictive assumptions, i.e. independent inputs, apply as for linear models. In addition to the estimates themselves, the bootstrap confidence intervals from the `sensitivity` package are shown. Two different estimation schemes, Jansen and Owen ^[see the respective references in the `sensitivity` package], are used. This is because the Owen estimator provides much tighter confidence intervals for the small main effects $S$ while the Jansen estimator is better for the total $T$ indices.
+
+```{r}
+
+# shuffle the columns to create independent variables
+x_indep = x
+for(icol in 1:dim(x_indep)[2]){
+  permu = sample.int(dessize, size = dessize, replace = FALSE)
+  x_indep[,icol] = x[permu, icol]
+}
+
+# helper function for the subsequent calls
+mdpredict = function(xin){
+  predict(md, newdata = xgb.DMatrix(as.matrix(xin)))
+}
+
+# estimation using the Jansen estimator
+
+# split the inputs into two sets of equal size n
+n = floor(dessize / 2)
+x_1 = x_indep[1:n,]
+x_2 = x_indep[-(1:n),]
+tt = soboljansen(mdpredict, x_1, x_2, nboot = nboot)
+
+# estimation using the Owen estimator
+
+# split the inputs into three sets of equal size n
+n = floor(dessize / 3)
+x_1 = x_indep[1:n,]
+x_2 = x_indep[n + (1:n),]
+x_3 = x_indep[2*n + (1:n),]
+ttt = sobolowen(mdpredict, x_1, x_2, x_3, nboot = nboot)
+
+
+df = cbind(ttt$S, tt$T)
+df = df[,-c(2,3,7,8)]
+colnames(df) = c("S", "min CI", "max CI", "T", "min CI", "max CI")
+row.names(df) = nm_x
+
+kable_styling(kable( round(df*100, 1),
+                     caption = "Main and Total Sobol indices"),
+              bootstrap_options = "striped", full_width = F)
+
+# for later comparison
+data_xgboost = list(indices=df[,c("T")])
+```
+
+
+## Shapley allocation
+
+Allocation of $R^2$ is done by the Shapley algorithm and refitting the model. This is exactly the same approach as for the linear model. $R^2$ is always computed on fresh test data. The algorithm implemented here is slightly more efficient than the one shown for linear models in that it no longer loops over all permutations but calculates first $R^2$ on all subsets and calculates then properly weighted differences of those subsets. Even though this is more efficient, variables still need to be grouped to limit computations. Here four groups are chosen, the three inputs $x_1$, $x_7$, $x_{13}$ and one group containing all remaining inputs.
+
+Note that the model is retrained for every set of input groups. The hyperparameters remain unchanged and every retraining is done with the same set of training data but there is no way to directly relate all the retrained models to each other. In that sense this procedure analyses more the algorithm as a whole than a single function $f$ or random variable $f(X)$.   
+
+```{r}
+
+# all rsquared will be tested on fresh oos
+idxdes_sh = sample.int(nxall, dessize, replace = FALSE)
+y_sh = yall[idxdes_sh]
+var_ysh = var(y_sh)
+
+# define groups
+tmp = list(x1=1, x7=7, x13=13)
+grp = c(tmp, list(rest = setdiff(1:nrf, unlist(tmp))))
+ngrp = length(grp)
+nm_grp = names(grp)
+
+# subsets are coded as binary vectors
+# make logical matrix of all possible subsets for retrieval of results
+# note: indices are one-based while binary numbers start with zero (= empty set)
+inclmat = array(FALSE, dim = c(2^ngrp, ngrp), dimnames = list(NULL, nm_grp))
+# holds the r2 value of the respective included groups
+r2mat = numeric(dim(inclmat)[1])
+# no group/empty set has R2 of zero
+r2mat[1] = 0
+
+for(isubgrp in 2:2^ngrp){
+  
+  inclmat[isubgrp,] = as.logical(intToBits(isubgrp - 1))[1:ngrp]
+  
+  # included variables
+  invar = unlist(grp[inclmat[isubgrp, ]])
+  xgtrain = x[idxtrain, invar, drop=FALSE]
+  dxgtrain = xgb.DMatrix(xgtrain, label = ytrain)
+  xgvali = x[-idxtrain, invar, drop=FALSE]
+  dxgvali = xgb.DMatrix(xgvali, label = yvali)
+  
+  # (re) fit the model
+  grmd = xgb.train(
+    verbose = 0,
+    params = hparams,
+    data = dxgtrain,
+    watchlist = list(train = dxgtrain, valid = dxgvali),
+    nrounds = 10000,
+    early_stopping_rounds = 20
+  )
+  
+  # calculate Rsquared
+  ypred = predict(grmd, newdata = xgb.DMatrix(xall[idxdes_sh, invar, drop=FALSE]))
+  r2mat[isubgrp] = 1 - mean((y_sh - ypred)^2) / var_ysh
+}
+
+# sum up properly weighted differences per group
+fgrp = factorial(ngrp)
+val_sh = numeric(ngrp)
+
+for(igrp in 1:ngrp){
+  
+  # find all subsets where current group is included
+  flg_in = inclmat[,igrp]
+  # associate rsquared where current group is included with the other members
+  tt_in = cbind(inclmat[flg_in, -igrp], r2mat[flg_in])
+  # associated rsquared where group was not included
+  tt_out = cbind(inclmat[!flg_in, -igrp], r2mat[!flg_in])
+  # join over all other members except current group
+  ttt = merge(tt_in, tt_out, by = nm_grp[-igrp])
+  colnames(ttt) = c(nm_grp[-igrp], "R2in", "R2out")
+  # number of members
+  nS = rowSums(ttt[,1:ngrp - 1])
+  # see the formula in Gröning for the coefficients
+  coeff = factorial(nS) * factorial(ngrp - nS - 1) / fgrp
+  val_sh[igrp] = coeff %*% (ttt[,"R2in"] - ttt[,"R2out"])
+}
+
+
+df = data.frame(values = round(c(val_sh) * 100,1),
+                labels=c(nm_grp) )
+print(waterfall( df, calc_total = TRUE, total_axis_text = "explained") )
+
+data_xgboost = c(data_xgboost, list(rsquared = sum(val_sh), shapley=val_sh))
+```
+
+Since we do not have access to the trees, it is not possible to provide a split as detailed as for the linear model. In particular we cannot estimate separate interaction effects.
+
+# Gaussian Process Regression
+
+This section introduces "Gaussian Process Regression" or "Kriging" using the package `DiceKriging`. This package is described in (@DiceKriging) a textbook reference for Gaussian Process Regression is (@Rasmussen/Williams). Except for this difference, the steps of the analysis are exactly the same as for `XGBoost`.
+
+
+## Initialisation and choice of hyperparameters  
+
+The selected hyperparameters are
+
+```{r}
+# for size 3000
+hparams = list(
+  Kern=c("matern5_2"),
+  Typ = c("SK"),
+  Range = c(x1=1.15, x2=10, x3=10, x4=10,
+            x5=2.01, x6=3.36, x7=0.6, x8=10,
+            x9=10, x10=10, x11=10, x12=10, x13=1.28),
+  Nugget = 0.01,
+  SD2 = 0.1
+)
+```
+
+Since Gaussian Process Regression assumes a stochastic structure on the space of regression functions, hyperparameters such as `Range`, `Nugget` and `SD2` above can be estimated by maximum likelihood. The entries for `Range` are scaling factors for the input variables and correspond to "correlation lengths". Large values indicate correlations over large distances, small values low correlations. This in turn allows the regression to be near constant (large correlation length) or very responsive (small correlation length) with respect to the different inputs. Note the correspondence between size of the range parameter and the variable importance established by prior analysis.  
+
+
+## Test of fit
+
+```{r, testoffit}
+# number of iterations
+niter = 10
+rsq = array(Inf, dim=c(niter,3), dimnames = list(NULL, c("out", "in", "delta")) )
+for(iiter in 1:niter){
+  
+
+    # select the points in the design
+  tmp = sample.int(nxall, 2 * dessize, replace = FALSE)
+  idxtmp = tmp[1:dessize]
+  xtmp = xall[idxtmp,]
+  ytmp = yall[idxtmp]
+
+  # test data for out-of-sample
+  idxtest = tmp[-(1:dessize)]
+  xtest = xall[idxtest,]
+  ytest = yall[idxtest]
+
+  # calculate Rsquareds
+  # define object with hparams
+  md = km(as.formula("~1"), xtmp, ytmp,
+                 covtype = hparams$Kern,
+                 nugget.estim=FALSE,
+                 noise.var = rep(hparams$Nugget, length(ytmp)),
+                 coef.trend = mean(ytmp),
+                 coef.var = max(hparams$SD2, 1e-21),
+                 coef.cov = hparams$Range)
+  ypred = predict(md, xtmp, type=hparams$Typ, se.compute = FALSE)$mean
+  rsq[iiter,"in"] = 1 - mean((ytmp - ypred)^2) / var(ytmp)
+  ypred = predict(md, xtest, type=hparams$Typ, se.compute=FALSE)$mean
+  rsq[iiter, "out"] = 1 - mean((ytest - ypred)^2) / var(ytest)
+}
+
+rsq[,"delta"] = rsq[, "out"] - rsq[,"in"]
+rsq = rbind(rsq,colMeans(rsq))
+row.names(rsq) = c(rep("",niter), "mean")
+kable_styling(kable(rsq*100, digits = 1),
+              bootstrap_options = "striped",
+              full_width = F)
+```
+
+The fit is somewhat improved over the quadratic model and overfitting limited. Nevertheless, $R^2$ values will be calculated out of sample.
+
+
+## Sobol indices
+
+Next follows the calculation of the main and total Sobol indices. The same restrictive assumptions, i.e. independent inputs, apply as for linear models. In addition to the estimates themselves, the bootstrap confidence intervals from the `sensitivity` package are shown.
+
+```{r, sobol}
+
+# refit single model for clarity
+idxdes = sample.int(nxall, dessize, replace = FALSE)
+
+x = xall[idxdes,]
+y = yall[idxdes]
+
+md = km(as.formula("~1"), x, y,
+                 covtype = hparams$Kern,
+                 nugget.estim=FALSE,
+                 noise.var = rep(hparams$Nugget, length(y)),
+                 coef.trend = mean(y),
+                 coef.var = max(hparams$SD2, 1e-21),
+                 coef.cov = hparams$Range)
+
+# shuffle the columns to create independent variables
+x_indep = x
+for(icol in 1:dim(x_indep)[2]){
+  permu = sample.int(dessize, size = dessize, replace = FALSE)
+  x_indep[,icol] = x[permu, icol]
+}
+
+# helper function for the subsequent calls
+mdpredict = function(xin){
+  predict(md, xin, type=hparams$Typ, se.compute = FALSE)$mean
+}
+
+# estimation using the Jansen estimator
+
+# split the inputs into two sets of equal size n
+n = floor(dessize / 2)
+x_1 = x_indep[1:n,]
+x_2 = x_indep[-(1:n),]
+tt = soboljansen(mdpredict, x_1, x_2, nboot = nboot)
+
+# estimation using the Owen estimator
+
+# split the inputs into three sets of equal size n
+n = floor(dessize / 3)
+x_1 = x_indep[1:n,]
+x_2 = x_indep[n + (1:n),]
+x_3 = x_indep[2*n + (1:n),]
+ttt = sobolowen(mdpredict, x_1, x_2, x_3, nboot = nboot)
+
+df = cbind(ttt$S, tt$T)
+df = df[,-c(2,3,7,8)]
+colnames(df) = c("S", "min CI", "max CI", "T", "min CI", "max CI")
+row.names(df) = nm_x
+
+kable_styling(kable( round(df*100, 1),
+                     caption = "Main and Total Sobol indices"),
+              bootstrap_options = "striped", full_width = F)
+
+data_gpr = list(indices=df[,"T"])
+```
+
+
+## Shapley allocation
+
+Allocation of $R^2$ is done by the Shapley algorithm and refitting the model. This is exactly the same approach as for the linear model. $R^2$ is always computed on fresh test data. The algorithm implemented here is slightly more efficient than the one shown for linear models in that it no longer loops over all permutations but calculates first $R^2$ on all subsets and calculates then properly weighted differences of those subsets. Even though this is more efficient, variables still need to be grouped to limit computations. Here four groups are chosen, the three inputs $x_1$, $x_7$, $x_{13}$ and one group containing all remaining inputs.
+
+Note that the model is retrained for every set of input groups. The hyperparameters remain unchanged and every retraining is done with the same set of training data but there is no way to directly relate all the retrained models to each other. In that sense this procedure analyses more the algorithm as a whole than a single function $f$ or random variable $f(X)$.
+
+```{r, shapley}
+
+# all rsquared will be tested on fresh oos
+idxdes_sh = sample.int(nxall, dessize, replace = FALSE)
+x_sh = xall[idxdes_sh, ]
+y_sh = yall[idxdes_sh]
+var_ysh = var(y_sh)
+
+# define groups
+tmp = list(x1=1, x7=7, x13=13)
+grp = c(tmp, list(rest = setdiff(1:nrf, unlist(tmp))))
+ngrp = length(grp)
+nm_grp = names(grp)
+
+# subsets are coded as binary vectors
+# make logical matrix of all possible subsets for retrieval of results
+# note: indices are one-based while binary numbers start with zero (= empty set)
+inclmat = array(FALSE, dim = c(2^ngrp, ngrp), dimnames = list(NULL, nm_grp))
+# holds the r2 value of the respective included groups
+r2mat = numeric(dim(inclmat)[1])
+# no group/empty set has R2 of zero
+r2mat[1] = 0
+
+for(isubgrp in 2:2^ngrp){
+
+  inclmat[isubgrp,] = as.logical(intToBits(isubgrp - 1))[1:ngrp]
+
+  # included variables
+  invar = unlist(grp[inclmat[isubgrp, ]])
+
+  # (re) fit the model, on original data, but new subset of variables
+  grmd = km(as.formula("~1"), x[,invar,drop=FALSE], y,
+                 covtype = hparams$Kern,
+                 nugget.estim=FALSE,
+                 noise.var = rep(hparams$Nugget, length(y)),
+                 coef.trend = mean(y),
+                 coef.var = max(hparams$SD2, 1e-21),
+                 coef.cov = hparams$Range[invar])
+
+  # calculate Rsquared
+  ypred = predict(grmd, x_sh[, invar, drop=FALSE], 
+                  type=hparams$Typ, se.compute = FALSE)$mean
+  r2mat[isubgrp] = 1 - mean((y_sh - ypred)^2) / var_ysh
+}
+
+# sum up properly weighted differences per group
+fgrp = factorial(ngrp)
+val_sh = numeric(ngrp)
+
+for(igrp in 1:ngrp){
+
+  # find all subsets where current group is included
+  flg_in = inclmat[,igrp]
+  # associate rsquared where current group is included with the other members
+  tt_in = cbind(inclmat[flg_in, -igrp], r2mat[flg_in])
+  # associated rsquared where group was not included
+  tt_out = cbind(inclmat[!flg_in, -igrp], r2mat[!flg_in])
+  # join over all other members except current group
+  ttt = merge(tt_in, tt_out, by = nm_grp[-igrp])
+  colnames(ttt) = c(nm_grp[-igrp], "R2in", "R2out")
+  # number of members
+  nS = rowSums(ttt[,1:ngrp - 1])
+  # see the formula in Gröning for the coefficients
+  coeff = factorial(nS) * factorial(ngrp - nS - 1) / fgrp
+  val_sh[igrp] = coeff %*% (ttt[,"R2in"] - ttt[,"R2out"])
+}
+
+df = data.frame(values = round(c(val_sh) * 100,1),
+                labels=c(nm_grp) )
+print(waterfall( df, calc_total = TRUE, total_axis_text = "explained") )
+
+data_gpr = c(data_gpr, list(rsquared = sum(val_sh), shapley=val_sh))
+```
+
+
+# Comparison, summary and conclusion
+
+The following two tables summarise the results in this set of reports. The three models covered were the linear model with quadratic features (Quadratic), XGBoost and Gaussian Process Regression (GPR). Shown first is the comparison of total Sobol indices, using independent inputs.  
+
+```{r}
+# load data from interaction report
+data_quad = readRDS(paste0(datadir, "export_quadratic.RDS"))
+
+df = data.frame(data_quad$indices, data_gpr$indices, data_xgboost$indices)
+colnames(df) = c("Quadratic", "GPR", "XGBoost")
+row.names(df) = nm_x
+
+kable_styling(kable( round(df*100, 1),
+                     caption = "Comparison of Total Sobol indices"),
+              bootstrap_options = "striped", full_width = F)
+```
+
+Although the three models analysed in these reports are radically different, the total Sobol indices are quite similar and agree in their ranking of the importance of the inputs. The variables $x_7$, $x_1$ and $x_{13}$ in this sequence are most important. All others are far less relevant, where $x_5$ and $x_6$ may still be borderline relevant, and all others can be safely ignored. 
+
+The similarity in outcomes is not surprising in light of the continuity property of the Sobol indices. Accordingly one can safely conclude a very similar ranking for the variables of the unknown regression function $\check{f}=\expect{y\mid X}.$     
+
+Next follows the comparison for the variance explained allocated by the Shapley algorithm.
+
+```{r}
+dfsh = data.frame(data_quad$shapley, data_gpr$shapley, data_xgboost$shapley)
+dfsh = rbind(colSums(dfsh), dfsh)
+colnames(dfsh) = c("Quadratic", "GPR", "XGBoost")
+row.names(dfsh) = c("$R^2$", c("x1", "x7", "x13", "rest"))
+
+kable_styling(kable( round(dfsh * 100, 1),
+                     caption = "Comparison of Shapley values"),
+              bootstrap_options = "striped", full_width = F)
+```
+
+Again very similar rankings. But for Shapley allocation, no continuity result is available. Hence it is not clear whether similar rankings are true for other models or what the importance values of the underlying function $\check{f}$ may be. 
+
+In total, already the simple interaction model provides a decent $R^2$ and accordingly a reliable assessment of total Sobol values, or as shown in the second report, even access to *all* Sobol indices. In this case variable importance can be established without great efforts to fit elaborate models.
+
+The case for Shapley values is more nuanced. Here the main constraint is the feasibility of the underlying computations and the lack of proof of continuity. 
+
+# References

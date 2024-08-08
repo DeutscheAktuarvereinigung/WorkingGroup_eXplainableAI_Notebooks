@@ -1,0 +1,743 @@
+---
+title: "Use Case \"Insurance SCR\" - Interaction"
+author: "gg"
+date: "`r Sys.Date()`"
+bibliography: ["./literatur/references.bib"]
+link-citations: yes
+output: 
+  bookdown::html_document2:
+    highlight: rstudio 
+    toc: true
+    number_sections: yes
+    toc_depth: 2
+---
+
+
+\newcommand{\v}[1]{\mathbb{V}{\left[#1\right]}}
+\newcommand{\expect}[1]{\mathbb{E}{\left[#1\right]}}
+\newcommand{\RR}{\mathbb{R}}
+\newcommand{\norm}[1]{\left\lVert #1 \right\rVert}
+
+
+# Linear Model with quadratic features
+
+The linear model with quadratic features is defined as
+$$ f(x)=\alpha + \sum_k \beta_k x_k + \sum_k \gamma_{kk} x_k^2 + \sum_{k<l}\gamma_{kl}x_k x_l.$$
+
+There are no particular reason within the Use Case to utilise polynomial features but it is a popular and quite typical model. Even though this model is still rather simple, a proper allocation of variance poses challenges which are quite similar to those encountered in more complex models. There are three new issues:
+
+  * What are the allocation targets? In contrast to the main effects model, the same variable now appears in different features (e.g. $x_i$ in $x_i$, $x_i^2$ and all mixed terms $x_i x_j$)
+  * The question of dependence between features is now unavoidable. Even if inputs are stochastically independent the features will be dependent.
+  * The sheer number of features is much larger: With $d$ input variables there are $(d+1) + d + \frac{(d-1)d}{2}$ features to deal with.
+
+These issues will be addressed by Sobol-Indices, which rely on the functional ANOVA decomposition (see Section 8.4 of [@Molnar2022]).
+
+
+# Model fit
+
+The main reason to introduce new features is to improve the fit. In the code below the model is repeatedly fit and its $R^2$ calculated. To assess stability and to rule out excessive overfitting in and out of sample $R^2$ is reported for several independent runs of the calibration. Note that we will fit the model on centred, i.e. mean zero, inputs. This is no loss of generality since the model remains quadratic.
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo=TRUE, cache = TRUE, cache.comments=FALSE, comment=NA, out.width="90%", attr.source=".numberLines")
+
+suppressPackageStartupMessages(library(knitr))
+suppressPackageStartupMessages(library(kableExtra))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(waterfalls))
+suppressPackageStartupMessages(library(sensitivity))
+
+# seed for reproducibility
+set.seed(4711)
+datadir = "./data/"
+
+# Number of portfolio
+ipf = 1
+
+# data (.csv) files
+fnm_xtrain = paste0(datadir,"Portfolio", ipf, "/train_input.csv")
+fnm_ytrain = paste0(datadir,"Portfolio", ipf, "/train_result.csv")
+
+xtrain = as.matrix(read.csv(fnm_xtrain)[,-1])
+
+nxtrain = dim(xtrain)[1]
+nrf = dim(xtrain)[2]
+# names of input variables
+nm_x = paste0("x", seq.int(1,nrf))
+colnames(xtrain) = nm_x
+
+# prepare response aka y
+ytrain = as.matrix(read.csv(fnm_ytrain)[,-1])
+
+# define formula for the interactions
+tm_main = paste(nm_x, collapse = "+")
+tm_quad = paste(paste0("I(", nm_x,"^2)"), collapse = "+")
+tm = paste0("(", tm_main,"):(", tm_main,")")
+fml = as.formula(paste0("y~", tm, "+", tm_quad))
+fml_brev = as.formula(paste0("~ 0 + ", tm, "+", tm_quad))
+
+# size of subset for the calibration
+dessize = 4000
+
+# number of iterations
+niter = 10
+rsq = array(Inf, dim=c(niter,3), dimnames = list(NULL, c("out", "in", "delta")) )
+for(iiter in 1:niter){
+  # select the points in the design
+  tmp = sample.int(nxtrain, 2 * dessize, replace = FALSE)
+  idxtrain = tmp[1:dessize]
+  # select and centre the inputs
+  x = scale(xtrain[idxtrain,], center = TRUE, scale = FALSE)
+  y = ytrain[idxtrain]
+  var_y = var(y)
+
+  # test data for out-of-sample
+  idxtest = tmp[-(1:dessize)]
+  xtest = scale(xtrain[idxtest,], center = TRUE, scale = FALSE)
+  ytest = ytrain[idxtest]
+  var_ytest = var(ytest)
+
+  # fit the model
+  dfin = as.data.frame(cbind(y, x))
+  md = lm( fml, dfin)
+  # calculate Rsquareds
+  rsq[iiter,"in"] = 1 - mean((y - md$fitted.values)^2) / var_y
+  rsq[iiter, "out"] = 1 - mean((ytest - predict(md, as.data.frame(xtest)))^2) / var_ytest
+}
+
+rsq[,"delta"] = rsq[, "out"] - rsq[,"in"]
+rsq = rbind(rsq,colMeans(rsq))
+row.names(rsq) = c(rep("",niter), "mean")
+kable_styling(kable(rsq*100, digits = 1,# row.names = TRUE,
+          ), bootstrap_options = "striped", full_width = F)
+
+```
+In conclusion, the fit is quite robust, substantially improved over the main effects only model and overfitting is still quite limited.
+
+
+# Functional ANOVA decomposition
+
+The functional ANOVA is a unique decomposition defined for every square-integrable function into uncorrelated elements onto which variance can be allocated. Thus solving two of the issues mentioned above. But it comes with a big disadvantage, this decomposition exists only for input variables which are stochastically independent. For this reason, we make the assumption of independent input variables in this section. The appropriateness of this assumption in light of the Use Case and the dependency in its input dataset will be discussed in Section \@ref(indep-useful).
+
+
+## Identification of components
+
+Since the model now contains interactions between variables, we would like to distinguish between effects due to the various variable on their own (the main effects) and any impact some variables may have due to their interactions with other variables. This is achieved by decomposing the function $f$ into additive components, such that the components only depend on single variables, on two variables etc. But a function can be decomposed into a sum in many different ways, which raises the question of *uniqueness* of the decomposition. Since we would like to attribute something to the components which is supposed to have an objective meaning, we need to make sure that the components are not arbitrary. This is non-trivial already in the simple and explicitly given linear model with interacting features above. While the model is already split into a sum of components and these components either stand on their own or interact, this decomposition is not unique. For the simple model
+$$ f(x) = x_1 + x_1 x_2 = (x_1 + 1)x_2$$
+it is not clear whether $f$ has a main effect $x_1$ and interaction $x_1x_2$ or consists of a pure interaction effect $(x_1 + 1)x_2$ only. This question can get more complicated quickly. For all $a,b\in\RR$:
+$$ 1 + x_1 + x_2 + x_1 x_2 = (1-ab) + (1 + a)x_1 + (1 + b)x_2 + (1 - a)x_1 (1-b)x_2.$$
+
+Both decompositions will have exactly the same predictions and are indistinguishable in a black-box setting. But even when having access to the function, any explanation which relies only on coefficients is in danger of being arbitrary.^[This non-uniqueness can not even be removed by centring the variables. Centring forces $ab=0$ but one degree of freedom still remains.]
+
+
+## Definition and basic properties of the functional ANOVA
+
+Let $X=(X_1,\ldots, X_d)$ denote the random input variables, For a subset $u=(j_1,\ldots,j_k)\subset\left\{1,\ldots,d\right\}$ denote by $X_u=(X_{j_1}, \ldots,X_{j_k})$ the according subset of the input variables and write
+$$\expect{f(X) \lvert X_u} = \expect{f(X) \lvert (X_{j_1},\ldots,X_{j_k})}$$ 
+
+for the conditional expectation. Note that $\expect{f(X) \lvert X_u}$ is a function depending only on the $k$ variables $X_u=(X_{j_1}, \ldots,X_{j_k})$. Set $f_\emptyset=\expect{f}$ and define
+$$ f_u(X_u)=\expect{f(X) \lvert X_u} - \sum_{v\subsetneq u} f_v(X_v).$$ The functional ANOVA decomposition is the sum of these components over all possible subsets of variables 
+$$ f(X)=\sum_{u\subset \{1,\ldots,d\}}f_u(X_u).$$
+
+The decomposition has the following properties:
+
+  * It exists for all $f$ with finite variance.
+  * It is unique.
+  * All components with $u\neq \emptyset$ have zero mean: $\expect{f_u}=0.$
+  * For all $k\in u: \int f_u(X_u) dX_k = 0$ and for all $v\subset u: \expect{f_u \lvert X_v}=0.$ 
+  * The different components are uncorrelated $\expect{f_u f_v}=0$ for all $u\neq v.$
+
+For a proof and additional properties of the decomposition see (@KuoSloan). A concise summary including related results can be found in [Owen](https://artowen.su.domains/mc/A-anova.pdf).
+
+## Sobol indices
+
+Due to the uncorrelatedness and uniqueness of all components of the sum, the variance of $f$ allows the unique decomposition 
+$$ \v{f(X)}=\sum_{u\subset \{1,\ldots,d\}}\v{f_u(x_u)}.$$ As done before one can normalise by the variance of $f$ to obtain
+$$ 1 = \sum_{u\subset \{1,\ldots,d\}}S_u$$
+where $$ S_u=\frac{\v{f_u}}{\v{f}}$$ is the Sobol index of the inputs $X_u.$ Since they are variances of uncorrelated components the Sobol indices have the properties of a decomposition:
+
+  * Each Sobol index is non-negative: $0\leq S_u.$
+  * The indices sum to one: $\sum_u S_u=1.$
+  
+But Sobol indices do not solve the third issue mentioned above: There are in total $2^d$ of them. This means for our Use Case $d=$ `r nrf` and $2^d=$ `r 2^nrf` which is clearly not a practical number. This is why in practice only the main effects or *first order Sobol indices*, i.e. the indices where $u=\{i\}$ is a singleton, 
+
+$$ 
+S_i = \frac{\v{\expect{f \lvert X_i}}}{\v{f}} \qquad \text{ for all } i=1,\ldots,d 
+(\#eq:DefiSi)
+$$
+
+are studied together with the *total Sobol indices*
+$$ T_i = \sum_{ \substack{ u\subset\{1,\ldots,d\} \\ i\in u } } S_u  \qquad \text{ for all } i=1,\ldots,d.$$
+
+Each $S_i$ captures the main effect attributable to $X_i$, while $T_i$ captures the effects of $X_i$ including all its interactions with other variables, pairwise as well as those of higher order.
+
+Main and total Sobol indices have those useful properties:
+
+  * $\sum S_i\leq 1$ and $\sum S_i = 1$ if and only if $f$ is a purely additive function. 
+  * $1 - \sum S_i$ is a measure of the amount of interaction in $f$.
+  * $S_i \leq T_i$ and $S_i=T_i$ means again a purely additive model without interactions.
+  * $T_i=0$ means the variable $X_i$ has no influence on $f$ at all.
+
+
+## Further properties of the functional ANOVA decomposition
+
+Many key concepts are more or less directly related to and can be easily derived from the functional ANOVA decomposition. 
+
+
+### Effective dimension
+
+How the variance of a target function is distributed over terms of low and high interaction defines a natural measure of the complexity of a function. The **effective dimension in the superposition sense** is defined for a suitable cutoff $\delta>0$ as the smallest integer $n$ such that
+
+$$ \sum_{\overset{u\subset\{1\ldots,d\}}{\#u\leq n}}S_u \geq 1 - \delta$$
+where $\#u$ is the number of elements in $u$. A small effective dimension means you need only few inputs, in particular only few interactions, to explain the variance of $f$ up to a prespecified accuracy. Accordingly a function with small effective dimension is inherently simpler to explain than a function with large effective dimension.
+
+
+### Partial dependence plots
+
+1-Dimensional Partial dependence plots (@Molnar2022 Chapter 8.1) are the plots of the uncentred main order functional ANOVA components $f_{\{i\}}(X_i) + f_\emptyset$ and analogous statements are true for higher dimensions.
+
+
+### Permutation Feature Importance
+
+If all input variables are independent, i.e. if the functional ANOVA decomposition exists, and if the loss function is least squares, Permutation Feature Importance (@Molnar2022, Chapter 8.5) is closely related to total Sobol indices. In fact, if the feature space of a model is closed under integration, which is quite a natural condition in many cases, Permutation Feature Importance of an input $j$ is just twice the non-normalised total Sobol index
+$$ PFI(X_j)=2 T_j * \v{f}.$$
+
+A proof of this can be found in the Appendix \@ref(PFItotalSobol).
+
+### Approximation property of Sobol indices
+
+Sobol indices, respectively the functional ANOVA decomposition from which the indices are derived, are model agnostic. Not only because they can be computed for any model $f$ but also because they provide a consistent framework for all functions which satisfy the assumptions of the existence of the functional ANOVA. This is actually useful in practice because it enables the user to gain information from one model and draw conclusions about all other possible models. This useful property can be summarised succinctly as: 
+  
+  - If two models have high $R^2$ for the same underlying response they have similar Sobol indices.
+  - If a model has high $R^2$ its Sobol indices are close to the "true" Sobol indices, i.e. those of the underlying response.
+  
+The discussion in Appendix \@ref(Approximation) will provide evidence for these statements and derive computable quantitative bounds not only for single indices such as the first order indices but for any grouping of indices as well ^[ As shown in (@KuoSloan) the components arise from orthogonal projection operators. So the approximation property follows directly from their continuity. The additional value of the derivation here is that it is quite elementary and produces concrete bounds.].
+
+
+## Functional ANOVA decomposition for quadratic features
+
+In most cases Sobol indices will be estimated by Monte Carlo methods and we will cover this in the next chapter. But the linear model with quadratic features is simple enough so that one can calculate the decomposition explicitly. This is impossible for general models, for example because the internal structure of the model may be inaccessible and even if it is accessible, the required conditional expectations may be impossible to compute. Nevertheless, it is quite illuminating to go through this exercise for quadratic features since it clarifies the abstract concepts and provides a base case to validate the Monte Carlo estimates.
+
+Observe that under our assumptions i.e. independent and centred $X_k$ 
+$$ f_\emptyset = \expect{f} = \alpha + \sum_k \gamma_{kk}\expect{X_k^2}.$$
+
+The conditional expectations are also straightforward:
+$$ \expect{X_k \lvert X_i} = \begin{cases} \expect{X_k} = 0 &\text{ if } k\neq i \\
+X_i &\text{ if } k = i 
+\end{cases}$$
+as well as
+$$ \expect{X_k^2 \lvert X_i} = \begin{cases} \expect{X_k^2} &\text{ if } k\neq i \\
+X_i^2 &\text{ if } k = i. 
+\end{cases}$$
+
+Furthermore with $1,\ldots, i<j, \ldots,d:$
+$$ \expect{X_k \lvert X_i, X_j} = \begin{cases} 0 &\text{ if } k\notin \{i,j\} \\
+X_i &\text{ if } i = k \\
+X_j &\text{ if } j = k . 
+\end{cases}$$
+
+Due to the mutual independence of all $X_k$ it follows that $\expect{X_k X_l \lvert X_i} = \expect{X_k\lvert X_i} \expect{X_l \lvert X_i}$ and 
+$$ \expect{f \lvert X_i}  = \alpha + \beta_i X_i + \gamma_{ii} X_i^2 + \sum_{k \neq i}\gamma_{kk} \expect{X_k^2}.$$
+This means the first order components are
+$$ f_i = \expect{f \lvert X_i}  - f_\emptyset = \beta_i X_i + \gamma_{ii} X_i^2 - \gamma_{ii} \expect{X_i^2}.$$
+
+In the same way one can conclude that
+$$ \expect{f \lvert X_i, X_j}  = \alpha + \beta_i X_i + \beta_j X_j + \gamma_{ii} X_i^2 + \gamma_{jj} X_j^2 + \sum_{k\notin \{i,j\}}\gamma_{kk} \expect{X_k^2} + \gamma_{ij} X_i X_j$$
+
+and 
+$$ f_{ij} = \expect{f \lvert X_i, X_j} - f_i - f_j - f_\emptyset = \gamma_{ij} X_i X_j.$$
+
+The higher order components have to be zero because first and second order components already sum up to the total function:
+$$ \sum_{i<j} f_{ij} + \sum_i f_i + f_\emptyset = f.$$
+
+Since we are working with the empirical measure given by the selected training dataset, the variances needed to obtain the first order Sobol indices are easily computed as empirical variances. The total Sobol indices are then:
+$$ T_i = S_i + \sum_{i\neq j} S_{ij}.$$
+
+```{r indep}
+# fit the model (on the dependent inputs)
+idxtrain = sample.int(nxtrain, dessize, replace = FALSE)
+# select and centre the inputs
+x = scale(xtrain[idxtrain,], center = TRUE, scale = FALSE)
+y = ytrain[idxtrain]
+
+dfin = as.data.frame(cbind(y, x))
+md = lm( fml, dfin)
+
+# the sequence of coefficients is: (alpha, betas, gamma_ii, gamma_ij)  
+cf = md$coefficients[-1]
+nm_cf = names(cf)
+
+# create design matrix, same sequence of columns as coefficients
+# shuffle the rows in each column to create independent variables 
+x_indep = x
+for(icol in 1:dim(x_indep)[2]){
+  permu = sample.int(dessize, size = dessize, replace = FALSE)
+  x_indep[,icol] = x[permu, icol]
+}
+
+# calculate variance of f on independent inputs
+var_f = var(predict(md, newdata = as.data.frame(x_indep)))
+
+# fml_brev is without intercept
+modmat = model.matrix(fml_brev, as.data.frame(x_indep))
+
+v_i = array(0, dim=c(nrf), dimnames = list(nm_cf[1:nrf]))
+for(ifeat in 1:nrf){
+  v_i[ifeat] = var(modmat[, ifeat] * cf[ifeat] + modmat[,nrf + ifeat]*cf[nrf + ifeat])
+}
+
+# variance of f_ij
+# number of mixed columns x_1 x_j with i<j
+n_ij = nrf * (nrf - 1)/2
+v_ij = array(0, dim = n_ij, 
+             dimnames = list(nm_cf[2 * nrf + seq.int(1, n_ij)]))
+# loop over the remaining columns of the design matrix containing the mixed features
+for(iidx in seq.int(1, n_ij)){
+    v_ij[iidx] = var(modmat[, 2 * nrf + iidx] * cf[2 * nrf + iidx])
+}
+
+# Sobol indices
+
+# first order
+S = v_i / var_f
+# to simplify the addition for T put all v_ij in a matrix as two triangles
+S_ij = array(0, dim = c(nrf, nrf))
+S_ij[lower.tri(S_ij, diag = FALSE)] = v_ij
+S_ij = S_ij + t(S_ij)
+S_ij = S_ij / var_f
+
+# total Sobol indices
+TT = S + colSums(S_ij)
+
+st = cbind(S, TT)
+df_st = round(as.data.frame(st) * 100, 1)
+cstmp = round(colSums(st) * 100,1)
+df_st = rbind(df_st, cstmp)
+dimnames(df_st) = list(c(nm_x, "total"), c("S", "T"))
+df_st["total", "T"] = ""
+
+# all S_ij
+df = round(as.data.frame(S_ij) * 100, 1)
+diag(df)=""
+rstmp = round(rowSums(S_ij) * 100,1)
+# prepend col with row sums and append row with grand total S_ij and empty
+df = rbind(cbind(rstmp, df), c(round(sum(S_ij) / 2 * 100,1), rep("", nrf)))
+dimnames(df) = list(c(nm_x, "total"), c("total row", nm_x))
+
+kable_styling(kable(cbind(df_st,df), caption = "$R^2$ allocated on all components"), bootstrap_options = "striped", full_width = F)
+```
+
+Again the entries for the totals (`r df_st["total", "S"]`% and `r df["total", "total row"]`%) do not exactly sum up to 100% due to the marginal distributions not being exactly zero-correlated. The leakage is `r round((1 - (sum(v_i) + sum(v_ij))/var_f)*100, 1)`%.
+
+
+## Monte Carlo Estimation for Sobol indices
+
+Since their introduction by I. Sobol in the early nineties, much time and effort went into refining and improving estimates for Sobol indices. The package `sensitivity` alone covers 11 different approaches. Here just the basic idea will be discussed and a simple implementation provided as a proof-of-concept. More and in-depth information can be found in the references contained in the package `sensitivity` or from the paper (@Saltelli2010).
+
+Start with the definition of $S_i$ in equation \@ref(eq:DefiSi). Since it is straightforward to estimate $\v{f}$ the challenge is to find a Monte Carlo estimate for the variance of the conditional expectations $\v{\expect{f\lvert X_i}}.$ Since 
+$$ \v{\expect{f\lvert X_i}} = \expect{\expect{f\lvert X_i}^2} - \expect{\expect{f\lvert X_i}}^2$$
+and 
+$$ \expect{\expect{f\lvert X_i}} = \expect{f}$$
+which is again easy to estimate, it suffices to find an estimator for the first term on the right hand side. Recall that the conditional expectation $\expect{f\lvert X_i}$ is the $d-1$ dimensional integral over all marginal distributions of the variables $X_k$ except $X_i$, which shall be denoted by $d \bf{x}_{-i}$, i.e.
+$$\expect{f\lvert X_i} = \int f(x_1,\ldots,x_i, \ldots,x_d)\,d \bf{x}_{-i}.$$
+A clever "trick" is now to observe that the square of this expression can be written as the following $2(d-1)$ dimension integral
+$$\expect{f\lvert X_i}^2 = \expect{f\lvert X_i} \expect{f\lvert X_i} = \int f(x_1,\ldots,x_i, \ldots,x_d)f(x_1',\ldots,x_{i-1}',x_i,x_{i+1}', \ldots,x_d')\,d \mathbf{x}_{-i}\,d\mathbf{x'}_{-i}.$$
+Integrating this expression over the only remaining variable $x_i$ yields
+$$ \expect{\expect{f\lvert X_i}^2} = \int \expect{f\lvert X_i}^2\,dx_i = \int\int f(x_1,\ldots,x_i, \ldots,x_d)f(x_1',\ldots,x_{i-1}',x_i,x_{i+1}', \ldots,x_d')\,d \mathbf{x}_{-i}\,d\mathbf{x'}_{-i}\, dx_i.$$
+Note that $dx_i$ can be combined with $d\mathbf{x}_{-i}$ such that this double integral can be written as a single integral with respect to the product measure $d\mathbf{x}d\mathbf{x'}_{i}$ over the $2d-1$ variables of the function
+$$ f(x_1,\ldots,x_i, \ldots,x_d)f(x_1',\ldots,x_{i-1}',x_i,x_{i+1}', \ldots,x_d').$$
+But this is just a single integral which can be estimated by Monte Carlo by splitting the input dataset into two independent sets $X$ and $X'$ of size $N$ and applying the estimate
+
+$$ \hat{V}_i=\frac{1}{N} \sum_{j=1}^N f(x_1^{(j)},\ldots,x_i^{(j)}, \ldots,x_d^{(j)}) f(x_1'^{(j)},\ldots,x_{i-1}'^{(j)},x_i^{(j)},x_{i+1}'^{(j)}, \ldots,x_d'^{(j)}) - \frac{1}{N}\sum_{j=1}^N f(x_1^{(j)},\ldots,x_i^{(j)}, \ldots,x_d^{(j)})^2.$$
+The following code block implements this estimation procedure.
+
+```{r}
+# squared expected value E[f]^2
+fmeansq = mean(predict(md, newdata = as.data.frame(x_indep)))^2
+
+# split the inputs into two sets of equal size n
+n = dessize / 2
+x_1 = x_indep[1:n,]
+f_1 = predict(md, newdata = as.data.frame(x_1))
+x_2 = x_indep[-(1:n),]
+
+# Calculate each v_i but this time using mc 
+vi_mc = array(0, dim=c(nrf), dimnames = list(nm_cf[1:nrf]))
+for(icol in 1:nrf){
+  mixmat = x_2
+  mixmat[,icol] = x_1[,icol]
+  f_mix = predict(md, newdata = as.data.frame(mixmat))
+  vi_mc[icol] = mean(f_mix * f_1) - fmeansq  
+}
+
+Si_mc = vi_mc / var_f
+
+df = round(data.frame(S, Si_mc) * 100,1)
+dimnames(df) = list(c(nm_x), c("analytic", "DIY MC"))
+kable_styling(kable( df, 
+     caption = "First order Sobol indices for quadratic features"),
+  bootstrap_options = "striped", full_width = F)
+```
+
+Note that the MC estimate just requires calls to the `predict` function as sole information about the model. Accordingly it is model agnostic and works without knowledge of the internal structure.
+
+With further clever combinations of the inputs the total Sobol indices can be calculated in a similar way and quite efficiently, see the references for details. For first order and total Sobol indices together only $N(d + 2)$ evaluations of $f$ are required. The next table shows $S$ and $T$ calculated with the package `sensitivity` which uses an improved estimator.
+
+```{r, }
+# we need a predict function with correct formula
+tmppredict = function(fml, cf, xin){
+  model.matrix(fml, as.data.frame(xin)) %*% cf
+}
+
+mdpredict = function(xin){
+  tmppredict(fml_brev, md$coefficients[-1], xin)
+}
+
+tt = soboljansen(mdpredict, as.data.frame(x_1), as.data.frame(x_2))
+
+#For better comparison all S in one go
+
+df_allS = round(data.frame(S, Si_mc, tt$S) * 100,1)
+dimnames(df_allS) = list(c(nm_x), c("analytic", "DIY MC", "sensitivity"))
+kable_styling(kable( df_allS, 
+       caption = "First order Sobol indices for quadratic features"), 
+     bootstrap_options = "striped", full_width = F)
+
+df_allT = round(data.frame(TT, tt$T) * 100,1)
+dimnames(df_allT) = list(c(nm_x), c("analytic", "sensitivity"))
+kable_styling(kable( df_allT,
+       caption = "Total Sobol indices for quadratic features"),
+     bootstrap_options = "striped", full_width = F)
+
+# save indices for comparison in third report
+data_quad = data.frame(indices=TT)
+```
+
+The package `sensitivity` provides in addition the possibility to report the uncertainty of the MC estimate using bootstrap confidence intervals.
+
+## Are independent inputs appropriate or useful? {#indep-useful}
+
+The functional ANOVA decomposition nicely illustrates the fundamental problem with dependent and independent inputs. The main effects function $f_1$ is a function which "only depends on" $X_1$ in the sense that it can be written as $f_1=f_1(X_1)$ without reference to any other inputs. But if $X_1$ and $X_7$ are not independent then in general $\expect{f_1(X_1) \lvert X_7}=h(X_7)$ will be a non-constant function of $X_7$ and in this sense $f_1(X_1)$ is **not** a function of $X_1$ alone. The stochastic dependence creates an interaction even though the function itself contains none. This also explains why the idea to "only change $X_1$ while everything else remains the same" is just not possible. So from this perspective the answer is probably a resounding no: Independent inputs make no sense! In light of this fact, all versions of statements such as "GAMs/additive models are interpretable" should be taken with a grain of salt as long as the underlying input distribution is not fully specified, understood and sufficiently simple. This of course is likewise true for all methods which implicitly assume independence such as methods which rely on permuting features. 
+
+On the other hand it is true that some partial information can be gained from analysis under the independence assumption. For prediction one only cares about $f(X)$ with the given/observed dependent joint input distribution $X$. But for explanation/interpretation you need to distinguish between $f$ and the inputs because you need to explain the output in terms of the inputs or simple features derived from those. From this distinction arises the utility of analysis under independence assumptions. Although the distribution of $f(Z)$ under independent inputs $Z$ will be quite different from the distribution of $f(X)$, the former can be used to gain information about $f$ as a (deterministic) function  $f:\RR^d\rightarrow\RR.$ This is a bit like studying the payout of a complex derivative without caring about the underlying or like analysing the terms of a reinsurance contract without description of the underlying portfolio. For the following reasons analysing $f$ under an independent input distribution $Z$ may be a useful tool:
+
+  - It allows for the functional ANOVA decomposition, which makes the structure of $f$ itself transparent.
+  - It provides a means to summarise the complex behaviour of $f$ into a few statistics, such as the allocated amounts of variance. 
+
+That said, the analyst should be aware of and deal with all issues which this ensues:
+
+  - The method allocates the variance of $f(Z)$ which is quite different from the original variance of $f(X)$. Note, that in line 23 of the code block directly before Table \@ref(tab:indep) a new variance is calculated and that all subsequent $R^2$ which follow refer to this variance not the original one.
+  - Independent inputs may create "impossible data". You may predict for an annuity which starts before the insured is born or develop reserves for losses where the accident year is before the underwriting year^[Quite specific to our Use Case, the scatter plot of inputs $x_1$ and $x_7$ in the first report did show that the domain was not rectangular. Under independent distribution the scatter will be rectangular. So we can be certain to have included "impossible data" in the calculations above.]. 
+  - Even if the data is not logically impossible, the new measure will reweigh all observations. The variance and its allocation may be determined by areas of the input space where the model has seen almost no training data and which are completely irrelevant for the application. 
+
+In conclusion, while definitely not completely useless, independent analysis is dangerous. One reason why it is still so popular, may be the fact that alternative solutions come with their own problems. 
+
+
+# Shapley allocation
+
+Even for the simple quadratic model the allocation of variance according to the Shapley algorithm poses several challenges:
+
+  * Any distinction between main and interaction features has to be reflected in the definition of possible coalitions. Shall an interaction term $f_{ij}$ be grouped together with $f_i$ with $f_j$ or is it a new and different target?
+  * As mentioned before, the number of calculations grows exponentially with the number of targets. This limits severely the number of possible targets for the allocation.
+  * What is an appropriate value function? The natural candidate in light of the ANOVA decomposition above, were the conditional variances $\v{\expect{f\lvert X_u}}$. But these are exceedingly difficult to calculate if the only available information about the inputs are independent samples from the joint distribution of $X$.
+  
+Here, the same approach as in the first part will be adopted, i.e. the attribution of variance explained by the Shapley algorithm, which means incremental $R^2$ as the value function.
+
+It would be an excellent idea to inform the choice of allocation targets by domain knowledge about the underlying actuarial model of the risk factors. For reasons explained before this is impossible here. A pragmatic choice informed by the prior results on main effects and the independent decomposition is to combine the features into a few groups to reduce the overall number of inputs. These targets are calculated by splitting the inputs into four non-overlapping categories: $x_1$, $x_7$, $x_{13}$ and one group containing all remaining inputs. Each combination of input variables has all quadratic features made up of those variables.   
+
+
+```{r}
+
+# all rsquared will be tested on fresh oos
+idxdes_sh = sample.int(nxtrain, dessize, replace = FALSE)
+# select and centre the inputs
+x_sh = scale(xtrain[idxdes_sh,], center = TRUE, scale = FALSE)
+y_sh = ytrain[idxdes_sh]
+var_ysh = var(y_sh)
+
+# define groups
+tmp = list(x1=1, x7=7, x13=13)
+grp = c(tmp, list(rest = setdiff(1:nrf, unlist(tmp))))
+ngrp = length(grp)
+nm_grp = names(grp)
+
+# subsets are coded as binary vectors
+# make logical matrix of all possible subsets for retrieval of results
+# note: indices are one-based while binary numbers start with zero (= empty set)
+inclmat = array(FALSE, dim = c(2^ngrp, ngrp), dimnames = list(NULL, nm_grp))
+# holds the r2 value of the respective included groups
+r2mat = numeric(dim(inclmat)[2])
+# no group/empty set has R2 of zero
+r2mat[1] = 0
+
+for(isubgrp in 2:2^ngrp){
+  
+  inclmat[isubgrp,] = as.logical(intToBits(isubgrp - 1))[1:ngrp]
+  
+  # included variables
+  invar = unlist(grp[inclmat[isubgrp, ]])
+  
+  # (re) fit the model, on original data, but new subset of variables
+  
+  # define formula for features
+  nm_var = nm_x[invar]
+  tm_main = paste(nm_var, collapse = "+")
+  tm_quad = paste(paste0("I(", nm_var,"^2)"), collapse = "+")
+  tm = paste0("(", tm_main,"):(", tm_main,")")
+  fml = as.formula(paste0("y~", tm, "+", tm_quad))
+  
+  md = lm(fml, data.frame(y=y, x[,invar,drop=FALSE]))
+  
+  # calculate Rsquared
+  ypred = predict(md, data.frame(x_sh[, invar, drop=FALSE]))
+  r2mat[isubgrp] = 1 - mean((y_sh - ypred)^2) / var_ysh
+}
+
+# sum up properly weighted differences per group
+fgrp = factorial(ngrp)
+val_sh = numeric(ngrp)
+
+for(igrp in 1:ngrp){
+  
+  # find all subsets where current group is included
+  flg_in = inclmat[,igrp]
+  # associate rsquared where current group is included with the other members
+  tt_in = cbind(inclmat[flg_in, -igrp], r2mat[flg_in])
+  # associated rsquared where group was not included
+  tt_out = cbind(inclmat[!flg_in, -igrp], r2mat[!flg_in])
+  # join over all other members except current group
+  ttt = merge(tt_in, tt_out, by = nm_grp[-igrp])
+  colnames(ttt) = c(nm_grp[-igrp], "R2in", "R2out")
+  # number of members
+  nS = rowSums(ttt[,1:ngrp - 1])
+  # see the formula in Gröning for the coefficients
+  coeff = factorial(nS) * factorial(ngrp - nS - 1) / fgrp
+  val_sh[igrp] = coeff %*% (ttt[,"R2in"] - ttt[,"R2out"])
+}
+
+df = data.frame(values = round(c(val_sh) * 100,1),
+                labels=c(nm_grp) )
+print(waterfall( df, calc_total = TRUE, total_axis_text = "explained") )
+
+data_quad = c(data_quad, list(shapley=val_sh))
+# store for later import into third report
+saveRDS(data_quad, paste0(datadir, "export_quadratic.RDS"))
+
+```
+
+
+# Appendix: further theory
+
+This Section provides further analysis of the theory behind the approximation property and the relation between total Sobol indices and Permutation Feature Importance. The available literature did not provide a reference but the statements seem relevant. They are relegated to the Appendix, since they are not necessary for immediate applications.
+
+## Permutation Feature Importance and total Sobol index {#PFItotalSobol}
+
+
+### Permutation versus independent draws
+
+Permutation Feature Importance is defined in [@Molnar2022, Chapter 8.5] as " the increase in the prediction error of the model after we permuted the feature’s values". Prediction error after permuting means recalculating the mean squared error when an original input instance is replaced with one of the remaining $N-1$ instances of the sample. Since this definition excludes drawing the same attribute twice it is slightly different from independent redraws. To simplify the following argument, we redefine Permutation Importance slightly and assume *independent* draws from the empirical marginal distributions. The difference between independent draws and permutations is obviously negligible, if the size $N$ of the dataset is sufficiently large. Hence we define the permutation feature importance of input $j$ as 
+
+$$ PFI(j)=\expect{(y - f(X_{(j)}))^2} - \expect{(y - f(X))^2}$$
+
+where $X=(X_1,\ldots,X_d)$ are the original inputs as defined by the dataset and $X_{(j)}$ denotes the vector where all inputs are the same as $X$ except the one input $X_j$ which is replaced by a copy $X'_{j}$. The $X'_{j}$ copy has the same (marginal) distribution as $X_j$ but is independent from all $X_i$ with $i\neq j$ and is in addition also independent from the response $y$. All expectations are taken with respect to the joint probability distribution $(y, X_1,\dots,X_d, X'_j).$ Recall that we assume throughout that all $X_i$ are mutually independent as well. 
+
+
+### Relationship to total Sobol indices
+
+Replace in the definition above $y - f(X_{(j)})$  by $(y - f(X)) + ( f(X) - f(X_{(j)}) )$ cancel the terms $\expect{(y - f(X_{(j)}))^2}$ to obtain
+
+\begin{equation}PFI(j) = \expect{(f(X) - f(X_{(j)}))^2} - 2 \expect{( y - f(X) )(f(X) - f(X_{(j)}))}.
+(\#eq:decomp) \end{equation}
+
+Apply the functional ANOVA decomposition to $f(X)$ and $f(X_{(j)})$ and notice that
+$$ \text{ For all } u\subset\{1,\ldots,d\} \text{ with } j\notin u: f_u(X)=f_u(X_{(j)}).$$
+This means that all terms of the decomposition which do not contain $j$ cancel and
+$$ f(X) - f(X_{(j)}) = \sum_{\overset{u\subset\{1,\ldots,d\}}{j\notin u}}f_{(u,j)}(X_u,X_j) - f_{(u,j)}(X_u,X'_j).$$
+
+To determine $\expect{(f(X) - f(X_{(j)}))^2}$ expand the square with the decomposition above and observe that all "mixed" terms are orthogonal, i.e. if $v\neq u$ then
+$$\expect{\left(f_{(u,j)}(X_u,X_j) - f_{(u,j)}(X_u,X'_j)\right) 
+\left(
+  f_{(v,j)}(X_v,X_j) - f_{(v,j)}(X_v,X'_j)
+\right)} = 0.$$
+which follows directly from the orthogonality property $\expect{f_u(x_u)f_v(x_v)}=0$ for $u\neq v$ of the functional ANOVA decomposition.  
+
+The only terms remaining are terms where $u=v$, i.e. 
+$$ \expect{\left(f_{(u,j)}(X_u,X_j) - f_{(u,j)}(X_u,X'_j)\right)^2}$$ but this can again be expanded and - after cancelling mixed terms again - written as
+
+$$ \expect{\left(f_{(u,j)}(X_u,X_j)\right)^2} + \expect{\left(f_{(u,j)}(X_u,X'_j)\right)^2}.$$
+Since $X_j$ and $X'_j$ have the same distribution this is just
+$$ 2 \expect{ \left(f_{(u,j)}(X_u,X_j) \right) ^2}.$$
+
+In total
+$$ \expect{(f(X) - f(X_{(j)}))^2} 
+= \sum_{\overset{u\subset\{1,\ldots,d\}}{j\notin u}} 
+    \expect{\left(f_{(u,j)}(X_u,X_j) - f_{(u,j)}(X_u,X'_j)\right)^2} 
+= 2 \sum_{\overset{u\subset\{1,\ldots,d\}}{j\notin u}}
+    \expect{ \left(f_{(u,j)}(X_u,X_j) \right) ^2} 
+= 2  T_j  \v{f}.$$
+
+
+### Conditions for $\expect{( y - f(X) )(f(X) - f(X_{(j)}))} = 0$
+
+It remains to show respectively to clarify under what conditions the remaining term in equation \@ref(eq:decomp)
+$$ \expect{( y - f(X) )(f(X) - f(X_{(j)}))} = 0.$$
+
+Note first that this is not always true. The following provides a simple counterexample. Assume the input space is two-dimensional $[-\frac 1 2, \frac 1 2]^2$ with the independent uniform measure. The target function is $$y(X_1, X_2)=X_1$$ and the feature space for regression is one-dimensional $\mathscr{F}=\{ \gamma X_1 X_2^2 \lvert \gamma\in\RR\}.$ A straightforward calculation produces the least squares optimal regression coefficient $\gamma = \frac {20} 3$. Accordingly the regression function is $f(X_1, X_2) = \frac{20} 3X_1X_2^2$. Since the regression function $f$ contains $X_2$ the total Sobol index of variable $X_2$ can not be zero: $$T_2\neq 0.$$ 
+
+On the other hand $X_2$ is independent from $y(X_1,X_2)=X_1$, which means that permutations of $X_2$ or exchanging $X_2$ with an identically distributed copy $X'$ which is independent from $y$ does not change the mean squared error and the Permutation Feature Importance has to be zero:
+$$ PFI(2) = \expect{\left(X_1 - \frac{20} 3 X_1X_2^2\right)^2} - \expect{\left(X_1 - \frac{20} 3 X_1(X')^2\right)^2} = 0.$$
+To understand what goes wrong and to define an appropriate sufficient condition, observe that the regression residuals $y-f$ are always orthogonal to $f$ and accordingly 
+$$ \expect{( y - f(X) )(f(X) - f(X_{(j)}))} = \expect{( y - f(X) )f(X_{(j)})}.$$
+
+After applying the functional ANOVA decomposition to $f(X_{(j)})$ one can use the fact that $X'_j$ is independent from $y$ and $f$ to integrate out all terms of the decomposition which involve the variable $X'_j$:
+
+\begin{align} 
+\expect{( y - f(X) )f(X_{(j)})}
+& = \expect{( y - f(X) )\sum_{u\subset\{1,\ldots,d\}}f_u(X_{(j)u})} \\
+& = \expect{\int\Big( 
+    ( y - f(X) )\sum_{u\subset\{1,\ldots,d\}}f_u(X_{(j)u})
+  \Big)\,dX'_j}\\
+& = \expect{( y - f(X) )\sum_{u\subset\{1,\ldots,d\}}
+  \int\Big( f_u(X_{(j)u})\Big)\,dX'_j}\\
+& = \expect{( y - f(X) )\sum_{\overset{u\subset\{1,\ldots,d\}}{i\notin u}} f_u(X_{u})}.\\
+\end{align}
+where for the last line the property of the functional ANOVA decomposition was used that 
+$$\text{ For all }k\in u: \int f_u(X_u) dX_k = 0.$$  
+
+As the counterexample above showed, this orthogonality condition for single ANOVA
+terms $f_u$ need not always hold. It does hold if the feature space is closed under integration. This means that for any feature function $\phi(X_1,\ldots,X_d)$ and every subset $u\subset\{1,\ldots,d\}$ the integrated feature $\int \phi(X_1,\ldots,X_d) \,dX_u$ is again an element of the feature space. Since the residuals of a least squares fit are orthogonal to the whole feature space, they are automatically orthogonal to the $f_u$ as well since those are linear combinations of the features. 
+
+For polynomial features this is fulfilled, if the feature space contains all lower order interactions and main effects, if it contains a high order polynomial. This is exactly what went wrong in the counterexample, the feature space contains the third order interaction $X_1X_2^2$ but it does not contain the lower order main effects $X_1$, $X_2$ and $X_1X_2.$ The same is true for tree based models since integrals of trees are again trees. It may not necessarily hold for all Gaussian Process Regression models.
+
+
+## Approximation property {#Approximation}
+
+
+### Defining groups of indices
+
+In the following $f$ denotes the known function/model and $y$ either the unknown underlying true function or just any other model. Let $U$ be any non-empty set of subsets of $\{1,\ldots,d\}$. $U$ may be a singleton $U=\{i\}$ for a main effect or a set such as $\{\{1,i\}, \{2,i\},\ldots, \{d,i\}\}$ for the total Sobol index $T_i$. Its complement in the set of subsets is $\bar{U}$. Now $f$ and $y$ can be split into two parts each:
+
+$$ f_1 = \sum_{u\in U}f_u \quad\text{ and }\quad f_2 = \sum_{u\in \bar{U}}f_u $$
+and 
+$$ y_1 = \sum_{u\in U}y_u \quad\text{ and }\quad y_2 = \sum_{u\in \bar{U}}y_u. $$
+
+Do to the uncorrelatedness of the terms of the ANOVA decomposition the variance split as well
+$$ \v{f} = \v{f_1} + \v{f_2} \quad\text{ and }\quad \v{y} = \v{y_1} + \v{y_2}.$$
+
+The Sobol indices of $f$ and $y$ associated with $U$ are
+$$ S_1^f = \frac{\v{f_1}}{\v{f}}, S_2^f = \frac{\v{f_2}}{\v{f}}\quad\text{ and }\quad S_1^y = \frac{\v{y_1}}{\v{y}}, \quad S_2^y = \frac{\v{y_2}}{\v{y}}.$$
+
+
+### The closeness constraint
+
+The "closeness" of $f$ and $y$ is defined in terms of $R^2$. This means $f$ is close to $y$ if $f$ has an $R^2$ for $y$ close to 100% or
+$$ R^2 =1 - \frac{\expect{(f-y)^2}}{\v{f}} \geq 1 - \delta\quad\text{ where }\quad 0\leq\delta\ll 1$$
+or equivalently 
+\begin{equation} 
+  \expect{(f-y)^2}\leq \delta^2\v{f}^2\quad\text{ where }\quad 0\leq\delta\ll 1. (\#eq:closeness)\end{equation}
+
+Note, that $R^2$ is here defined slightly different from the usual way. It is defined relative to the known model $f$ not in terms of the empirical variance of the unknown function $y$ as it is normally done. This is done to make the bounds computable in terms of known quantities. To simplify notation and to emphasise the geometric nature of the subsequent arguments, we use the norm notation, i.e. write $\expect{g^2}=\norm{g}^2$ for functions $g$ which are square integrable with respect to the underlying measure. 
+
+To get rid of the constant terms, use the functional ANOVA decomposition to split the functions orthogonally into a constant and the non-constant rest $f = f_\emptyset + \tilde{f}$, $y = y_\emptyset + \tilde{y}$. But this means 
+$$ \delta^2\v{f}=
+\norm{\tilde{f}}^2\geq \norm{\tilde{y} + y_\emptyset - \tilde{f} - f_\emptyset}^2
+=\norm{\tilde{y} -\tilde{f} }^2 + (y_\emptyset - f_\emptyset)^2\geq \norm{\tilde{y} -\tilde{f} }^2.$$
+
+In other words: If functions $f$ and $y$ are close, their zero mean versions will be close as well. In addition, the Sobol indices themselves are defined using variance and accordingly invariant under adding a constant. This means bounds for the zero mean versions will also be bounds for the original functions. Hence we can assume without loss of generality that $f$ and $y$ are zero mean.
+
+
+### Angles
+
+The Sobol indices for a group $U$ and its complement $\bar{U}$ as defined above are non-negative and sum up to one. This means we can define angles $\phi$ and $\psi$ with $0\leq \phi, \psi\leq\frac \pi 2$ such that:
+$$ \cos \phi = \sqrt{S_1^f}=\frac{\norm{f_1}}{\norm{f}} \quad\text{ and }\quad \sin \phi = \sqrt{S_2^f}=\frac{\norm{f_2}}{\norm{f}}$$ 
+$$\cos\psi=\sqrt{S_1^y}=\frac{\norm{y_1}}{\norm{y}} \quad\text{ and }\quad \sin\psi=\sqrt{S_2^y}=\frac{\norm{y_2}}{\norm{y}}.$$
+Since $\cos$ is decreasing on $[0, \frac \pi 2]$ bounding $S_1^y$ from above amounts to making the angle $\psi$ as small as possible and for the lower bound as large as possible.  
+
+### Bounds for $S_1^y$
+
+The task is now to find upper and lower bounds for$S_1^y$ under the closeness constraint \@ref(eq:closeness) for $f$ and $y$.  We will connect the angle with the closeness constraint by writing $y = f + d$ for a suitable $d$ and split this into orthogonal parts $y_1 = f_1 + d_1$ and $y_2 = f_2 + d_2$ using the functional ANOVA decomposition. This can then be written as 
+$$ \cot\psi = \frac{\norm{y_1}}{\norm{y_2}}=\frac{\norm{f_1+d_1}}{\norm{f_2+d_2}}.$$
+This quotient respectively $\cot\psi$ can be directly connected to $\cos\psi$. Since both functions are strictly decreasing on $[0, \frac \pi 2]$ a upper(lower) bound for $\cot\psi$ will produce a upper(lower) bound for $\cos\psi$ after a straightforward transformation. This quotient can be bounded above and below by applying the triangle and the reverse triangle equality:
+
+$$ \frac{\big| \norm{f_1}-\norm{d_1}\big|}{\norm{f_2}+\norm{d_2}} \leq \frac{\norm{f_1+d_1}}{\norm{f_2+d_2}}\leq\frac{\norm{f_1}+\norm{d_1}}{\big| \norm{f_2}-\norm{d_2}\big|}.$$
+Given these bounds for vectors $d_1$ and $d_2$ with length $\norm{d_1}$ and $\norm{d_2}$ we now need to find among all possible vectors those pairs which are consistent with the closeness constraint and produces the largest(smallest) possible angle $\psi$. This constrained optimisation problem can be solved geometrically using the sketch below:
+
+```{r, echo=FALSE, out.width='80%', fig.align='center', fig.cap='Lengths $\\norm{d_1}$ and $\\norm{d_2}$ realising largest and smallest angle $\\psi$'}
+knitr::include_graphics('pic_psioptimisation.png')
+```
+
+Notice, that 
+
+  - the picture respectively the angles are scale invariant. This reflects the fact that Sobol indices and the closeness condition are scale invariant. To avoid clutter by $\norm{f}$ terms, the picture is scaled such that $\norm{f}=1.$
+  - All points within the circle of radius $\delta$ represent $\norm{d_1}, \norm{d_2}$ combinations which are consistent with the closeness condition. 
+  - the angle $\psi^*$ is the smallest angle consistent with the closeness constraint, it defines the upper bound. The angle $\psi_*$ is the largest angle consistent with the closeness constraint, it defines the lower bound.
+  
+Since any tangent and the radius form a right angle the following relation holds:
+$$ \sin(\psi_* - \phi) = \delta\quad\text{ and }\quad \sin(\phi - \psi^*) = \delta.$$
+This is true for all values within the first quadrant, i.e. for $0<\psi<\frac \pi 2.$ If the circle becomes so large that it touches the $\norm{f_1}$-axis then $\psi^*=0$ and $\cos\psi^*=1$ which means the bound for the Sobol index has attained its maximum possible value. If the circle grows even further the tangent is no longer a point associated with a maximal Sobol index since points with $\psi=0$ are within the circle and have larger Sobol indices than the tangent. This is covered by the reverse triangle inequality as well, since $\psi=0$ is the case $\norm{f_2}=\norm{d_2}$ at which the denominator switches sign and starts growing again. Analogous reasoning applies to the case $\psi_*$ and the lower bound for $S_1^y$ of zero. As a consequence $\psi_*$ and $\psi^*$ have to be limited to $[0,\frac \pi 2]$ and the final solutions are
+$$ \psi_{**}=\min(\frac \pi 2, \psi_*)\quad\text{ and }\quad\psi^{**}=\max(0, \psi^*).
+(\#eq:approx)$$
+
+Now $\psi^*=\arccos{\sqrt{S_1^f}} - \arcsin\delta$ can be solved using well known trigonometric identities for 
+$$ \cos \psi_*=\sqrt{S_1^f}\sqrt{1-\delta^2} + \sqrt{1 - S_1^f}\delta$$
+and taking into account that
+$$ \psi^*\leq 0 \quad\text{ means }\quad S_1^f\geq 1-\delta^2$$
+the upper bound for $S_1^y$ is finally
+
+$$\sqrt{S_1^y}\leq\begin{cases}
+\sqrt{S_1^f}\sqrt{1-\delta^2} + \sqrt{1 - S_1^f}\delta &\text{ if }S_1^f< 1 - \delta^2\\ 
+1 &\text{ if }S_1^f \geq 1 - \delta^2.
+\end{cases} $$
+
+In the same way the lower bound can be determined as
+
+$$\sqrt{S_1^y}\geq\begin{cases}
+\sqrt{S_1^f}\sqrt{1-\delta^2} - \sqrt{1 - S_1^f}\delta &\text{ if }S_1^f > \delta^2\\ 
+0 &\text{ if }S_1^f \leq \delta^2.
+\end{cases} $$
+
+
+### Tightness of bounds
+
+To see that the bounds are tight, just recall that the triangle and the reverse triangle inequality are actually equalities if the involved vectors are scalar multiples of each other. This means choosing $d_1$ such that $y_1=f_1 + d_1 = (1 + \norm{d_1})f_1$ and $d_2$ such that $y_2=f_2 + d_2 = (1 + \norm{d_2})f_2$ where $\norm{d_1}$ and $\norm{d_2}$ are determined according to the recipe above, will provide $y$ where the bounds are attained.
+
+
+# References
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
