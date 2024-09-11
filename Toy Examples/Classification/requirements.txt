@@ -1,0 +1,12 @@
+alibi==0.9.5
+catboost==1.2.2
+dice_ml==0.9
+lime==0.2.0.1
+matplotlib==3.7.1
+numpy==1.24.3
+pandas==1.5.3
+PyALE==1.2.0
+scikit_learn==1.4.0
+seaborn==0.13.2
+shap==0.44.0
+statsmodels==0.14.0
