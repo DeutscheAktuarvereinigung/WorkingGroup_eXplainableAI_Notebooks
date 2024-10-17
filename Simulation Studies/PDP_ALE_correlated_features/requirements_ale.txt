@@ -1,0 +1,5 @@
+numpy==2.1.1 
+pandas==2.2.3 
+plotnine==0.13.6 
+scikit-learn==1.5.2 
+ipykernel==6.29.5
