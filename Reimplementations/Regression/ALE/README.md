@@ -21,7 +21,7 @@ We used the following packages to develop this notebook.
 We included a requirements.txt file, which can be used to e.g. create a conda environment.
 
 
-    conda create --name reimplmentation_ale --file  requirements_ale_reimplementation.txt
+    conda create --name reimplementation_ale --file  requirements_ale_reimplementation.txt
 
 
 If you are experiencing problems due to the strict use of version numbers, try using the requirements_ale_reimplementation_without_version_numbers.txt file or install the packages manually.

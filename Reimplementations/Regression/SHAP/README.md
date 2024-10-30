@@ -13,7 +13,7 @@ To run this notebook you just need
 
 * A working python installation and jupyter notebook. For the development python version 3.10.0. was used.
 * Necessary python packages to run the notebook are listed in the corresponding requirement file *requirements_SwedM_shap.txt.*
-* The necessary dataset *SwedishMotorInsurance.csv* can be found on https://github.com/DeutscheAktuarvereinigung/WorkingGroup_eXplainableAI_Notebooks/tree/main/Reimplementations/Regression and must be in the same folder as the notebook.
+* The necessary dataset *SwedishMotorInsurance.csv* can be found on https://github.com/DeutscheAktuarvereinigung/WorkingGroup_eXplainableAI_Notebooks/tree/main/Reimplementations/Regression/SHAP/ and must be in the same folder as the notebook.
 
 # Content overview
 
