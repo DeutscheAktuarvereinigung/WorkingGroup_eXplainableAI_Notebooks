@@ -4,6 +4,17 @@
 <p style="font-size:19px; text-align:left; margin-top: 15px; margin-bottom: 15px"><i>German Association of Actuaries (DAV) — Working Group "Explainable Artificial Intelligence"</i></p>
 <br>
 
+
+<p style="font-size:25px; text-align:left; margin-bottom: 25px"><b>Final Report (in German)</b></p>
+
+<br>
+
+[2024-05-27_Ergebnisbericht_DAV_AG_XAI.pdf](https://aktuar.de/unsere-themen/fachgrundsaetze-oeffentlich/2024-05-27_Ergebnisbericht_DAV_AG_XAI.pdf)
+
+<br>
+<br>
+
+
 <p style="font-size:25px; text-align:left; margin-bottom: 25px"><b>List of Notebooks (Grouped by Notebooks)</b></p>
 
 <br>
