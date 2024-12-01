@@ -10,6 +10,8 @@ This section covers installation details and provides a first overview of the co
 
 # Getting Started
 
+The Society of Actuaries Group Disability Insurance Experience Committee has written a report which provides background on the use case and the data. It can be found at URL [GLTD report](https://www.soa.org/4a7e84/globalassets/assets/files/resources/experience-studies/2019/2019-gltd-study-report.pdf).
+
 ## Prerequisites
 
 To run these notebooks you need
@@ -68,14 +70,13 @@ Note that some of notebooks can take quite some time to run. In this case a roug
 * "data_eda": Marginal plots of raw data and exposures.
 * "hptuning_tree" "hptuning_boost" *(coming soon)* Hyper-parameter tuning for the Gradient Boosted Tree (GBT) and the tree model.
 * "rep_boost", "rep_tree", "rep_GLM": *(coming soon)* Fit and performance analysis of the three models of the use case.
-
 * "rep_marginal": Marginal and calibration plots of the fitted models together with the raw data.
 * "exp_pfi": Explanation method Permutation Feature Importance.
 * "exp_drop1_boost", "exp_drop1_GLM": Explanation method drop1
-* "edu_depPDP", "GLTD_SSA_extract.feather": *(coming soon)* Case study on impossible data and according data file.
-* "exp_fanova", "edu_Hcorr": *(coming soon)* Analysis of interactions by variance analysis (correlated H-statistics)
+* "edu_depPDP", "GLTD_SSA_extract.feather": Case study on impossible data and according data file.
+* "exp_fanova", "edu_Hcorr": Analysis of interactions by variance analysis (correlated H-statistics)
 * "gltd_utilities.py": purely technical file, contains a utility function as import
-* "shap": *(coming soon)* SHAP Feature importance plots of the three models
+* "shap": SHAP Feature importance plots of the three models
 * "cache_*.pkl" various files with internal data.
 
 ## Authors
