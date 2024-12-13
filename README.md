@@ -9,7 +9,7 @@
 
 <br>
 
-[2024-05-27_Ergebnisbericht_DAV_AG_XAI.pdf](https://aktuar.de/unsere-themen/fachgrundsaetze-oeffentlich/2024-05-27_Ergebnisbericht_DAV_AG_XAI.pdf)
+[2024-05-27_Ergebnisbericht_DAV_AG_XAI.pdf](https://aktuar.de/content/PDF/Fachwissen/2024-05-27_DAV-Ergebnisbericht_Explainable_Artificial_Intelligence.pdf)
 
 <br>
 <br>
