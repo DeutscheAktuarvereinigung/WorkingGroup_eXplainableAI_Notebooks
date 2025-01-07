@@ -68,8 +68,8 @@ This finalises the set-up. You can now run any of the other notebooks in any ord
 Note that some of notebooks can take quite some time to run. In this case a rough estimate of run time is given in the introduction. You can always dial down (or up) the amount of processed data by adjusting `pct` in the notebooks.
 
 * "data_eda": Marginal plots of raw data and exposures.
-* "hptuning_tree" "hptuning_boost" *(coming soon)* Hyper-parameter tuning for the Gradient Boosted Tree (GBT) and the tree model.
-* "rep_boost", "rep_tree", "rep_GLM": *(coming soon)* Fit and performance analysis of the three models of the use case.
+* "hptuning_tree" "hptuning_boost" Hyper-parameter tuning for the Gradient Boosted Tree (GBT) and the tree model.
+* "rep_boost", "rep_tree", "rep_GLM": Fit and performance analysis of the three models of the use case.
 * "rep_marginal": Marginal and calibration plots of the fitted models together with the raw data.
 * "exp_pfi": Explanation method Permutation Feature Importance.
 * "exp_drop1_boost", "exp_drop1_GLM": Explanation method drop1
